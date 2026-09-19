@@ -124,6 +124,12 @@ Over USB, `--bench` measures a clean 30 fps, while the live view settles nearer
 every frame is stamped with the moment it arrived, so a recording keeps its real
 pacing whether the loop hit 30 or 26.
 
+Since the screen refreshes at roughly 30 Hz, rates that divide into it — 30, 15,
+10, about 7 — *may* sit more evenly against it than one in between, and a rate
+like 25 can end up slower than either neighbour. Treat that as a rule of thumb
+rather than exact science: if a recording looks uneven, try the nearest division
+of 30.
+
 ### Record while you watch
 
 ```
