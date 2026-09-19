@@ -149,6 +149,9 @@ $ screendump --from-file cap.mid --save-gif out.gif
 A `.mid` keeps every frame and its timing, so you can come back to a recording
 and re-cut it without touching the instrument again.
 
+⚠️ Some GIF viewers clamp very short delays, so a fast animation can play back
+slower than it was captured.
+
 ## Sound and video
 
 A GIF shows what the instrument is doing. For what it *sounds* like you need
@@ -214,11 +217,6 @@ quarters that when you want a quick look rather than something to keep.
 the OS gate on *any* audio input, including an instrument. If you refuse it, the
 recording silently comes out empty.
 
-**Why `.mid` and not the GIF?** A GIF has already rounded its timing to
-hundredths of a second, and a raw dump is a single frame with no timing at all.
-The `.mid` is the only format that knows when each frame appeared, so it is the
-only one that can drive a video.
-
 ### If sound and picture drift apart
 
 Every recording prints what the audio clock actually did:
@@ -251,26 +249,17 @@ screendump: ⚠️ cap.wav is 16.9 s but the recording is 104.2 s -- are they fr
 The video always follows the **picture**; sound that runs short is padded with
 silence and sound that runs long is trimmed.
 
-**Why `.mid` rather than `.syx`?** Timing. A `.syx` is a bare run of `F0 … F7`
-messages with nowhere to put it. A Standard MIDI File gives every event a delta,
-so the recording keeps its real pacing and stays readable by other MIDI tools.
-
-⚠️ GIF stores delays in **centiseconds**, so most frame rates cannot be written
-exactly: 30 fps is 33.3 ms, or 3.33 cs. Rounding each frame on its own would
-make every one of them lose the same third of a centisecond, and a ten-second
-animation would play back in nine. `screendump` carries the remainder from frame
-to frame instead, so the delays alternate 3 and 4 cs and the total stays right.
-
-`--framerate 25` is the one rate that needs no correction at all — 40 ms is
-exactly 4 cs. Some viewers also clamp delays below about 2 cs.
-
 ## Set it once per session
 
+Each variable takes exactly what its option takes — so the `0`s below are port
+**indices** from `--list-midi`, not "off" or "default", and the instrument can
+be written any of its three accepted ways.
+
 ```
-$ export SCREENDUMP_MIDI_IN=0
-$ export SCREENDUMP_MIDI_OUT=0
-$ export SCREENDUMP_AUDIO_IN=dt
-$ export SCREENDUMP_INSTRUMENT=dt
+$ export SCREENDUMP_MIDI_IN=0             # [0] from --list-midi
+$ export SCREENDUMP_MIDI_OUT=0            # [0] from --list-midi
+$ export SCREENDUMP_AUDIO_IN=dt           # short form, or an index from --list-audio
+$ export SCREENDUMP_INSTRUMENT=Digitakt   # or DT, or dt -- all three work
 
 $ screendump -x
 ```
