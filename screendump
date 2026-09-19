@@ -914,6 +914,16 @@ def _ffmpeg():
     return exe
 
 
+def wav_seconds(path):
+    """How long a .wav plays, or None if it cannot be read as one."""
+    try:
+        with wave.open(path, "rb") as fh:
+            rate = fh.getframerate()
+            return fh.getnframes() / rate if rate else None
+    except Exception:
+        return None
+
+
 def cfr_indices(starts, end_ms, fps):
     """Which captured frame each frame of a constant-rate video should show.
 
@@ -958,11 +968,28 @@ def write_video(path, frames, end_ms, instrument, args, audio_path=None):
     w, h, _ = parse_or_die(frames[0][0], instrument)
     width, height = w * scale, h * scale
 
+    # ⭐ THE PICTURE DECIDES THE LENGTH. `apad` makes the audio effectively
+    # endless, so `-shortest` stops at the last video frame: audio that runs
+    # short is padded with silence, audio that runs long is trimmed, and either
+    # way the video is as long as the capture was. Without `apad`, `-shortest`
+    # cuts the PICTURE down to the audio instead -- and because ffmpeg then
+    # closes the pipe early, that truncation is silent unless the write below
+    # treats a broken pipe as the failure it is.
+    seconds = len(order) / fps
+    if audio_path:
+        heard = wav_seconds(audio_path)
+        if heard is not None and abs(heard - seconds) > 0.5:
+            warn(f"⚠️ {audio_path} is {heard:.1f} s but the recording is "
+                 f"{seconds:.1f} s -- are they from the same capture?")
+            warn("    The video follows the picture; the sound is padded with "
+                 "silence or trimmed to fit.")
+
     cmd = [exe, "-y", "-loglevel", "error",
            "-f", "rawvideo", "-pix_fmt", "gray",
            "-s", f"{width}x{height}", "-r", str(fps), "-i", "-"]
     if audio_path:
-        cmd += ["-i", audio_path, "-c:a", "aac", "-b:a", "192k", "-shortest"]
+        cmd += ["-i", audio_path, "-c:a", "aac", "-b:a", "192k",
+                "-af", "apad", "-shortest"]
     cmd += ["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",   # H.264 wants even sides
             "-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-preset", "veryfast", "-crf", "18", path]
@@ -970,7 +997,7 @@ def write_video(path, frames, end_ms, instrument, args, audio_path=None):
     # `order` never decreases, so the frame on screen only has to be redrawn when
     # it actually changes -- one render per KEPT frame, not per output frame.
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    shown, buf = -1, b""
+    shown, buf, sent = -1, b"", 0
     try:
         for idx in order:
             if idx != shown:
@@ -978,12 +1005,18 @@ def write_video(path, frames, end_ms, instrument, args, audio_path=None):
                 buf = frame_bytes(unpack(px, w, h, args.flip), scale, args.invert)
                 shown = idx
             proc.stdin.write(buf)
+            sent += 1
         proc.stdin.close()
     except BrokenPipeError:
-        pass
+        # ffmpeg stopped reading before the recording ran out. Whatever it
+        # wrote is SHORT, so this is reported rather than passed over -- the
+        # earlier version swallowed it and still claimed the full length.
+        proc.wait()
+        die(f"ffmpeg stopped after {sent} of {len(order)} frames, so {path} is "
+            f"only {sent / fps:.1f} s of the {seconds:.1f} s recording.")
     if proc.wait() != 0:
         die(f"ffmpeg failed while writing {path}")
-    warn(f"wrote {len(order)} frames ({len(order) / fps:.1f} s) at {fps} fps, "
+    warn(f"wrote {sent} frames ({sent / fps:.1f} s) at {fps} fps, "
          f"{width}x{height}, "
          + ("with audio" if audio_path else "SILENT")
          + f" to {path}")

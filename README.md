@@ -202,19 +202,32 @@ only one that can drive a video.
 Every recording prints what the audio clock actually did:
 
 ```
-screendump: audio: 1438720 samples, 30.0 s, 0 overflows
-screendump: audio clock: 47999.2 Hz measured vs 48000 Hz nominal (-17 ppm, +11 ms over this capture)
+screendump: audio: 5001216 samples, 104.2 s, 0 overflows
+screendump: audio clock: 47999.3 Hz measured vs 48000 Hz nominal (-15 ppm, -2 ms over this capture)
 ```
 
 An interface that says 48000 Hz is really a crystal a few tens of parts per
 million away from that, while the frame times come from the computer's clock.
-The two disagree slowly — a few milliseconds a minute — so the figure is
-measured and printed rather than assumed. On a short capture it does not matter.
-On a long one, that last number is how far the sound has slid against the
-picture.
+The two disagree slowly, so the figure is measured and printed rather than
+assumed. That last number is how far the sound has slid against the picture.
+
+The figures above are a real Digitakt over USB: **−15 ppm, about a millisecond a
+minute**, so it would take roughly an hour to accumulate 50 ms. In practice this
+does not matter — but it is measured rather than promised.
 
 `0 overflows` is the other number to glance at. Anything above zero means
-samples were **dropped**, and the recording is short by that much.
+samples were **dropped**, and the recording is short by that much. A Digitakt
+polled at 30 fps for 104 seconds dropped none, so screenshotting the instrument
+does not disturb its audio.
+
+If you pair a `.wav` with a `.mid` from a different capture, you get told:
+
+```
+screendump: ⚠️ cap.wav is 16.9 s but the recording is 104.2 s -- are they from the same capture?
+```
+
+The video always follows the **picture**; sound that runs short is padded with
+silence and sound that runs long is trimmed.
 
 **Why `.mid` rather than `.syx`?** Timing. A `.syx` is a bare run of `F0 … F7`
 messages with nowhere to put it. A Standard MIDI File gives every event a delta,
