@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""Dump an Elektron instrument's screen to the terminal over MIDI.
+
+    screendump --list-midi
+    screendump -x --midi-in 0 --midi-out 0 --instrument dt
+    screendump -x --blocks | tee shot.txt
+    screendump --from-file frame.syx --instrument dt --blocks
+
+Ports are whatever --list-midi reports, given either as an index or as part
+of a port name. Indices are quickest; a name fragment survives replugging other
+gear, which can renumber the list.
+
+Writes to stdout, so it pipes and tees like anything else. Nothing is written to
+disk unless you ask with --save-syx / --save-raw.
+
+Set these once per terminal session and then run bare with -x:
+
+    SCREENDUMP_MIDI_IN   SCREENDUMP_MIDI_OUT   SCREENDUMP_INSTRUMENT
+
+An explicit option always wins over the environment. The names are read the same
+way everywhere, but the shell syntax to set them is not:
+
+    sh / bash / zsh     export SCREENDUMP_MIDI_IN=0
+    PowerShell          $env:SCREENDUMP_MIDI_IN = "0"
+    cmd.exe             set SCREENDUMP_MIDI_IN=0
+
+Requires python-rtmidi. The command is the same everywhere; only Linux may need
+system packages first, if pip has no wheel for your Python and falls back to
+building from source:
+
+    macOS       pip install python-rtmidi
+    Windows     pip install python-rtmidi
+    Linux       pip install python-rtmidi
+                needs ALSA headers if it builds from source --
+                libasound2-dev (Debian/Ubuntu), alsa-lib-devel (Fedora)
+"""
+
+# ---------------------------------------------------------------------------
+# THE ELEKTRON SYSEX SCREENSHOT RPC
+#
+#     F0 00 20 3C <id0> <id1>  <seven-bit-encoded body>  F7
+#
+#   00 20 3C          Elektron manufacturer id
+#   <id0> <id1>       instrument id -- see INSTRUMENTS below. Whether this is
+#                     product + unit or one 16-bit id is not established, so it
+#                     is carried as two opaque bytes per instrument.
+#
+#   body = msgId:u16be  replyTo:u16be  cmd:u8  payload
+#     cmd 0x04  ScreenshotRequest    empty payload  -> a 13 byte frame
+#     cmd 0x84  ScreenshotResponse
+#          payload = ver:u8  w:u16be  h:u16be  len:u32be  pixels[len]
+#
+#   A response command id is the request's | 0x80. The instrument assigns its
+#   own msgId and echoes the request's in replyTo.
+#
+#   The u32 length prefix in front of the pixels is easy to overlook: it belongs
+#   to the generic byte-array encoding rather than to the screenshot payload.
+#   Dropping it shifts the pixels by four bytes and shears the image across the
+#   middle. If a new instrument comes out sheared, check the frame size on the
+#   wire against what the geometry implies -- that difference is the tell.
+#
+#   Seven-bit encoding is MSB-first, 7 data bytes per group: a leader byte whose
+#   bit (6-i) is the MSB of data byte i, then the 7 bytes with their MSB
+#   cleared. A trailing partial group of n bytes emits 1 leader + n bytes.
+#
+# PIXEL FORMAT: the payload is the framebuffer copied verbatim, COLUMN-MAJOR --
+#   `width` columns, each ceil(height/32) big-endian 32-bit words. A column's
+#   words are concatenated into one big-endian value V, word 0 most significant,
+#   and row y is bit (stride*32 - height + y) of V. Row 0 therefore sits at the
+#   least significant end: with two words per column, the SECOND word carries
+#   the TOP rows.
+#
+#   A set bit is a LIT pixel. These screens are light on dark, and so is the
+#   rendering -- no inversion anywhere in the chain.
+#
+#   Instruments use this same packing for their own bitmap assets, so the rule
+#   is likely to hold for a new one. If a new instrument renders upside down,
+#   try --flip, and confirm against text on the screen rather than against a
+#   picture: a vertical flip leaves icons looking perfectly plausible, and only
+#   lettering fails loudly enough to be trusted.
+# ---------------------------------------------------------------------------
+
+import argparse
+import os
+import sys
+import time
+
+SYSEX_START = 0xF0
+SYSEX_END = 0xF7
+ELEKTRON = (0x00, 0x20, 0x3C)
+
+CMD_SCREENSHOT_REQUEST = 0x04
+CMD_SCREENSHOT_RESPONSE = 0x84
+
+
+class Instrument:
+    """An Elektron instrument, in one of two tiers.
+
+    IMPLEMENTED -- it carries an instrument id and a screen size, because a real
+    screen has been captured from that machine and read. Nothing is added on the
+    strength of a datasheet.
+
+    KNOWN -- the name and its short form, and nothing else. An entry like this
+    exists so that asking for it gives a straight answer instead of a puzzling
+    one. It cannot be attempted: without the two id bytes there is no request to
+    send, so an unimplemented instrument is not merely untested, it is
+    unreachable.
+    """
+
+    def __init__(self, name, short, ident=None, width=None, height=None):
+        self.name = name
+        self.short = short          # the community's short form, one word
+        self.ident = ident          # the two bytes after the manufacturer id
+        self.width = width
+        self.height = height
+
+    @property
+    def implemented(self):
+        return self.ident is not None
+
+    @property
+    def header(self):
+        return bytes((SYSEX_START,) + ELEKTRON + self.ident)
+
+
+# Order matters only for display. Short forms follow community usage (DT, DTII,
+# M:S) and are matched case-insensitively, so dt / DT / Dt all work, as does the
+# full name.
+INSTRUMENTS = [
+    Instrument("Digitakt",      "DT",   ident=(0x10, 0x00), width=128, height=64),
+    Instrument("Digitakt II",   "DTII"),
+    Instrument("Digitone",      "DN"),
+    Instrument("Digitone II",   "DNII"),
+    Instrument("Syntakt",       "ST"),
+    Instrument("Analog Rytm",   "AR"),
+    Instrument("Analog Four",   "A4"),
+    Instrument("Analog Heat",   "AH"),
+    Instrument("Model:Samples", "M:S"),
+    Instrument("Model:Cycles",  "M:C"),
+    Instrument("Octatrack",     "OT"),
+    Instrument("Machinedrum",   "MD"),
+]
+
+
+def find_instrument(spec):
+    """Exact match: the full name, the short form, or the short form lowercased.
+
+    Deliberately strict -- no case folding, no prefixes. 'digitakt', 'DigiTAKT'
+    and 'Digita' are all rejected. The instrument decides which bytes go on the
+    wire, so a typo should be an error rather than a quiet guess about which
+    machine was meant. (Port matching is the opposite: substring, because a port
+    is named by the operating system and nobody controls its spelling.)
+    """
+    for inst in INSTRUMENTS:
+        if spec in (inst.name, inst.short, inst.short.lower()):
+            return inst
+    return None
+
+
+def near_miss(spec):
+    """What someone probably meant, so a rejection can be useful."""
+    s = spec.strip().lower()
+    for inst in INSTRUMENTS:
+        if s in (inst.name.lower(), inst.short.lower()):
+            return inst
+    return None
+
+
+def implemented():
+    return [i for i in INSTRUMENTS if i.implemented]
+
+
+def not_implemented():
+    return [i for i in INSTRUMENTS if not i.implemented]
+
+
+def instrument_table(instruments):
+    """The accepted spellings, one row per instrument.
+
+    A name containing a space is shown quoted, because that is how it has to be
+    typed -- otherwise the shell splits it and argparse sees a stray argument.
+    """
+    pad = max(len(i.short) for i in INSTRUMENTS)
+    rows = []
+    for i in instruments:
+        name = f'"{i.name}"' if " " in i.name else i.name
+        rows.append(f"    {i.short:<{pad}}  {i.short.lower():<{pad}}  {name}")
+    return "\n".join(rows)
+
+
+# ------------------------------------------------------------- seven-bit codec
+
+def encode7(data):
+    """MSB-first 8-in-7 encoding."""
+    out = bytearray()
+    for base in range(0, len(data), 7):
+        group = data[base:base + 7]
+        leader = 0
+        for i, b in enumerate(group):
+            if b & 0x80:
+                leader |= 1 << (6 - i)
+        out.append(leader)
+        out.extend(b & 0x7F for b in group)
+    return bytes(out)
+
+
+def decode7(data):
+    """Inverse of encode7."""
+    out = bytearray()
+    for base in range(0, len(data), 8):
+        group = data[base:base + 8]
+        if len(group) < 2:
+            break
+        leader = group[0]
+        for i, b in enumerate(group[1:]):
+            out.append((b & 0x7F) | (0x80 if leader & (1 << (6 - i)) else 0))
+    return bytes(out)
+
+
+# ----------------------------------------------------------------- messages
+
+def build_request(instrument, msg_id=1):
+    body = bytes([(msg_id >> 8) & 0xFF, msg_id & 0xFF, 0, 0,
+                  CMD_SCREENSHOT_REQUEST])
+    return instrument.header + encode7(body) + bytes([SYSEX_END])
+
+
+def build_response(instrument, pixels, msg_id=0x2A, reply_to=1):
+    """Build a response frame exactly as the instrument does (for tests)."""
+    w, h = instrument.width, instrument.height
+    payload = (bytes([1, (w >> 8) & 0xFF, w & 0xFF, (h >> 8) & 0xFF, h & 0xFF])
+               + len(pixels).to_bytes(4, "big")
+               + pixels)
+    body = bytes([(msg_id >> 8) & 0xFF, msg_id & 0xFF,
+                  (reply_to >> 8) & 0xFF, reply_to & 0xFF,
+                  CMD_SCREENSHOT_RESPONSE]) + payload
+    return instrument.header + encode7(body) + bytes([SYSEX_END])
+
+
+def parse_response(sysex, instrument):
+    """Return (width, height, pixels) from one complete SysEx message."""
+    header = instrument.header
+    if not sysex.startswith(bytes((SYSEX_START,) + ELEKTRON)):
+        raise ValueError(f"not an Elektron SysEx frame: {sysex[:8].hex(' ')}")
+    if not sysex.startswith(header):
+        got = sysex[4:6].hex(' ')
+        want = bytes(instrument.ident).hex(' ')
+        raise ValueError(f"instrument id on the wire is {got}, but the "
+                         f"{instrument.name} expects {want}")
+    if sysex[-1] != SYSEX_END:
+        raise ValueError("frame does not end with F7")
+
+    body = decode7(sysex[len(header):-1])
+    if len(body) < 5:
+        raise ValueError(f"body too short ({len(body)} B, need >= 5)")
+    if body[4] != CMD_SCREENSHOT_RESPONSE:
+        raise ValueError(f"expected command 0x84, got {body[4]:#04x}")
+
+    payload = body[5:]
+    if len(payload) < 9:
+        raise ValueError("screenshot payload truncated")
+    ver = payload[0]
+    width = (payload[1] << 8) | payload[2]
+    height = (payload[3] << 8) | payload[4]
+    declared = int.from_bytes(payload[5:9], "big")
+    pixels = payload[9:]
+
+    if ver != 1:
+        warn(f"unexpected payload version {ver}")
+    expected = width * ((height + 31) // 32) * 4
+    if declared != expected:
+        warn(f"declared pixel length {declared} != {expected} implied by "
+             f"{width}x{height}")
+    if len(pixels) < declared:
+        raise ValueError(f"pixels truncated: {len(pixels)} B, declared {declared}")
+    return width, height, pixels[:declared]
+
+
+# ------------------------------------------------------------------- pixels
+
+def unpack(pixels, width, height, flip=False):
+    """Column-major words -> rows[y][x] booleans."""
+    stride = (height + 31) // 32
+    nbits = stride * 32
+    grid = [[False] * width for _ in range(height)]
+    for x in range(width):
+        v = 0
+        for k in range(stride):
+            o = (x * stride + k) * 4
+            v = (v << 32) | int.from_bytes(pixels[o:o + 4], "big")
+        for y in range(height):
+            grid[y][x] = bool((v >> (nbits - height + y)) & 1)
+    return grid[::-1] if flip else grid
+
+
+def pack(grid, width, height):
+    """Exact inverse of unpack (no flip)."""
+    stride = (height + 31) // 32
+    nbits = stride * 32
+    out = bytearray()
+    for x in range(width):
+        v = 0
+        for y in range(height):
+            if grid[y][x]:
+                v |= 1 << (nbits - height + y)
+        out.extend(v.to_bytes(stride * 4, "big"))
+    return bytes(out)
+
+
+# ---------------------------------------------------------------- rendering
+#
+# A terminal cell is about 1 wide : 2 tall, so a mode gives square pixels only
+# if it subdivides the cell in that same ratio. Braille (2x4) and half-blocks
+# (1x2) both do; quadrant blocks (2x2) do NOT, which is why they are not here --
+# they would render everything twice as tall as it should be.
+
+_BRAILLE = {(0, 0): 0x01, (0, 1): 0x02, (0, 2): 0x04, (0, 3): 0x40,
+            (1, 0): 0x08, (1, 1): 0x10, (1, 2): 0x20, (1, 3): 0x80}
+
+_HALF = {(False, False): " ", (True, False): "▀",
+         (False, True): "▄", (True, True): "█"}
+
+
+def render_braille(grid, invert=False):
+    h = len(grid)
+    w = len(grid[0]) if h else 0
+    lines = []
+    for cy in range(0, h, 4):
+        line = []
+        for cx in range(0, w, 2):
+            bits = 0
+            for (dx, dy), mask in _BRAILLE.items():
+                y, x = cy + dy, cx + dx
+                if y < h and x < w and (grid[y][x] != invert):
+                    bits |= mask
+            line.append(chr(0x2800 + bits))
+        lines.append("".join(line))
+    return "\n".join(lines)
+
+
+def render_blocks(grid, invert=False):
+    h = len(grid)
+    w = len(grid[0]) if h else 0
+    lines = []
+    for cy in range(0, h, 2):
+        line = []
+        for x in range(w):
+            top = grid[cy][x] != invert
+            bot = grid[cy + 1][x] != invert if cy + 1 < h else invert
+            line.append(_HALF[(top, bot)])
+        lines.append("".join(line))
+    return "\n".join(lines)
+
+
+def render_ascii(grid, invert=False, on="#", off="."):
+    return "\n".join("".join(on if (v != invert) else off for v in row)
+                     for row in grid)
+
+
+def render(grid, args):
+    if args.ascii:
+        return render_ascii(grid, invert=args.invert)
+    if args.blocks:
+        return render_blocks(grid, invert=args.invert)
+    return render_braille(grid, invert=args.invert)
+
+
+# -------------------------------------------------------------------- MIDI
+
+def _rtmidi():
+    try:
+        import rtmidi
+    except ImportError:
+        die("python-rtmidi is not installed.\n"
+            "    pip install python-rtmidi")
+    return rtmidi
+
+
+def port_names():
+    rtmidi = _rtmidi()
+    out = rtmidi.MidiOut()
+    inp = rtmidi.MidiIn()
+    try:
+        return inp.get_ports(), out.get_ports()
+    finally:
+        del out, inp
+
+
+def list_midi():
+    ins, outs = port_names()
+    print("MIDI inputs (instrument -> computer):")
+    for i, name in enumerate(ins) or []:
+        print(f"  [{i}] {name}")
+    if not ins:
+        print("  (none)")
+    print("MIDI outputs (computer -> instrument):")
+    for i, name in enumerate(outs) or []:
+        print(f"  [{i}] {name}")
+    if not outs:
+        print("  (none)")
+
+
+def resolve_port(spec, names, what):
+    """Resolve a port spec to an index.
+
+    Accepts an ordinal from --list-midi, an instrument short form (dt, dtii),
+    or any fragment of a port name. A fragment must identify exactly one port:
+    picking for you when two match would be the wrong kind of helpful.
+    """
+    listing = "\n".join(f"    [{i}] {n}" for i, n in enumerate(names)) or "    (none)"
+
+    if spec is None:
+        die(f"no {what} selected -- pass --{what} or set "
+            f"SCREENDUMP_{what.upper().replace('-', '_')}.\n"
+            f"    screendump --list-midi")
+
+    if spec.strip().lstrip("+-").isdigit():
+        idx = int(spec)
+        if not 0 <= idx < len(names):
+            die(f"{what} index {idx} is out of range.\n{listing}")
+        return idx
+
+    # an instrument short form stands in for its full name
+    inst = find_instrument(spec)
+    needle = inst.name if inst else spec
+
+    matches = [i for i, n in enumerate(names) if needle.lower() in n.lower()]
+    if not matches:
+        die(f"no {what} port matches {needle!r}.\n{listing}")
+    if len(matches) > 1:
+        die(f"{needle!r} does not uniquely identify a {what} port "
+            f"-- {len(matches)} match:\n"
+            + "\n".join(f"    [{i}] {names[i]}" for i in matches)
+            + "\n    Give the index instead, or a longer fragment.\n"
+              "    screendump --list-midi")
+    return matches[0]
+
+
+def capture(instrument, out_spec, in_spec, timeout_s, repeat=1, verbose=False):
+    """Send N screenshot requests, returning the replies and round-trip times."""
+    rtmidi = _rtmidi()
+    midi_in = rtmidi.MidiIn()
+    midi_out = rtmidi.MidiOut()
+    ins, outs = midi_in.get_ports(), midi_out.get_ports()
+
+    in_idx = resolve_port(in_spec, ins, "midi-in")
+    out_idx = resolve_port(out_spec, outs, "midi-out")
+    if verbose:
+        warn(f"out -> {outs[out_idx]}")
+        warn(f"in  <- {ins[in_idx]}")
+
+    midi_in.open_port(in_idx)
+    midi_in.ignore_types(sysex=False, timing=True, active_sense=True)
+    midi_out.open_port(out_idx)
+
+    request = list(build_request(instrument))
+    replies, timings = [], []
+    try:
+        for _ in range(repeat):
+            # drain anything already queued so a stale frame cannot be returned
+            while midi_in.get_message() is not None:
+                pass
+            buf = bytearray()
+            start = time.monotonic()
+            midi_out.send_message(request)
+            deadline = start + timeout_s
+            while time.monotonic() < deadline:
+                msg = midi_in.get_message()
+                if msg is None:
+                    time.sleep(0.0005)
+                    continue
+                data = msg[0]
+                if data and data[0] == SYSEX_START:
+                    buf = bytearray()
+                buf.extend(data)
+                if buf and buf[-1] == SYSEX_END:
+                    break
+            if buf and buf[-1] == SYSEX_END:
+                timings.append(time.monotonic() - start)
+                replies.append(bytes(buf))
+            elif repeat == 1:
+                die(f"timed out after {timeout_s:.1f} s with no complete SysEx "
+                    f"reply.\n    Check the ports with --list-midi, and that "
+                    f"the instrument is not busy with Overbridge.")
+    finally:
+        midi_in.close_port()
+        midi_out.close_port()
+        del midi_in, midi_out
+    return replies, timings
+
+
+def parse_or_die(raw, instrument):
+    """parse_response, but reporting problems the way the rest of the CLI does."""
+    try:
+        return parse_response(raw, instrument)
+    except ValueError as exc:
+        die(str(exc))
+
+
+def bench(instrument, args):
+    """Measure the achievable frame rate: round-trip time per capture."""
+    started = time.monotonic()
+    replies, timings = capture(instrument, args.midi_out, args.midi_in,
+                               args.timeout, repeat=args.bench,
+                               verbose=args.verbose)
+    wall = time.monotonic() - started
+    if not timings:
+        die(f"no frames returned in {args.bench} attempts")
+
+    ordered = sorted(timings)
+    size = len(replies[-1])
+    got = len(timings)
+
+    def ms(s):
+        return f"{s * 1000:.1f}"
+
+    print(f"--- {got}/{args.bench} frames, {size} B each")
+    print(f"round trip  min {ms(ordered[0])} ms   "
+          f"median {ms(ordered[got // 2])} ms   "
+          f"mean {ms(sum(timings) / got)} ms   max {ms(ordered[-1])} ms")
+    print(f"throughput  {got / wall:.1f} fps sustained ({wall:.2f} s wall clock)")
+    print(f"            {got * size / wall / 1000:.1f} kB/s of SysEx on the wire")
+    if got < args.bench:
+        print(f"!!! {args.bench - got} request(s) timed out")
+
+    # a frame rate is only meaningful if the frames were actually valid
+    width, height, pixels = parse_or_die(replies[-1], instrument)
+    print(f"last frame decoded cleanly: {width}x{height}, {len(pixels)} B of pixels")
+    return 0
+
+
+# ---------------------------------------------------------------- self test
+
+def synthetic_grid(instrument):
+    w, h = instrument.width, instrument.height
+    grid = [[False] * w for _ in range(h)]
+    for x in range(w):
+        grid[0][x] = True                 # top edge only
+    for y in range(h):
+        grid[y][0] = True                 # left edge only
+    for i in range(min(w, h)):
+        grid[i][i] = True                 # diagonal from the top-left
+    for y in range(4, 12):
+        for x in range(20, 40):
+            grid[y][x] = True             # a block near the top-left
+    return grid
+
+
+def expected_frame_size(instrument):
+    """Response frame size on the wire, derived from the instrument's geometry."""
+    stride = (instrument.height + 31) // 32
+    body = 5 + 1 + 2 + 2 + 4 + instrument.width * stride * 4
+    groups, rem = divmod(body, 7)
+    encoded = groups * 8 + (1 + rem if rem else 0)
+    return body, len(instrument.header) + encoded + 1
+
+
+def self_test(args, inst):
+    ok = True
+    body_len, frame_len = expected_frame_size(inst)
+
+    for n in (0, 1, 6, 7, 8, 13, body_len):
+        blob = bytes((i * 37 + 0x80) & 0xFF for i in range(n))
+        enc = encode7(blob)
+        if any(b & 0x80 for b in enc):
+            print(f"FAIL: encode7({n}) set a high bit"); ok = False
+        if decode7(enc) != blob:
+            print(f"FAIL: seven-bit round trip broke at n={n}"); ok = False
+    print(f"seven-bit codec: round-trips; {body_len} B body "
+          f"-> {len(encode7(bytes(body_len)))} B")
+
+    grid = synthetic_grid(inst)
+    pixels = pack(grid, inst.width, inst.height)
+    frame = build_response(inst, pixels)
+    if len(frame) != frame_len:
+        print(f"FAIL: built frame is {len(frame)} B, the geometry implies "
+              f"{frame_len}"); ok = False
+    w, h, px = parse_response(frame, inst)
+    if (w, h) != (inst.width, inst.height) or px != pixels:
+        print("FAIL: response parse did not reproduce the frame"); ok = False
+    else:
+        print(f"response frame: {len(frame)} B on the wire -> {w}x{h}, {len(px)} B pixels")
+
+    if unpack(px, w, h) != grid:
+        print("FAIL: unpack did not invert pack"); ok = False
+    else:
+        print("pixel unpack: exact inverse of pack")
+
+    req = build_request(inst)
+    if any(b & 0x80 for b in req[6:-1]):
+        print("FAIL: request body has a high bit set"); ok = False
+    print(f"request frame:  {len(req)} B  {req.hex(' ')}")
+
+    print()
+    print(render(unpack(px, w, h, args.flip), args))
+    print()
+    print("SELF-TEST", "PASSED" if ok else "FAILED")
+    return 0 if ok else 1
+
+
+# -------------------------------------------------------------------- main
+
+def warn(msg):
+    print(f"screendump: {msg}", file=sys.stderr)
+
+
+def die(msg):
+    warn(msg)
+    sys.exit(1)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="screendump",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    mode = ap.add_mutually_exclusive_group(required=True)
+    mode.add_argument("-x", "--external", action="store_true",
+                      help="capture from the instrument (SENDS MIDI)")
+    mode.add_argument("--from-file", metavar="PATH",
+                      help="render a saved .syx frame, or a raw pixel dump")
+    mode.add_argument("--list-midi", action="store_true",
+                      help="list MIDI ports as the system reports them")
+    mode.add_argument("--self-test", action="store_true",
+                      help="verify the codec and renderer, no instrument needed")
+    mode.add_argument("--emit-sample", metavar="PATH",
+                      help="write a synthetic response frame, for testing")
+    mode.add_argument("--bench", type=int, metavar="N",
+                      help="benchmark the achievable FRAME RATE over N captures: "
+                           "round-trip times, sustained fps, wire throughput "
+                           "(SENDS MIDI)")
+
+    ap.add_argument("--instrument", default=os.environ.get("SCREENDUMP_INSTRUMENT"),
+                    help="which instrument, spelled exactly: "
+                         + " / ".join(i.short for i in implemented())
+                         + " (or the lowercase form, or the full name). Short "
+                           "forms never need quoting; a full name with a space "
+                           "does. No default, deliberately. "
+                           "env SCREENDUMP_INSTRUMENT")
+    ap.add_argument("--midi-out", default=os.environ.get("SCREENDUMP_MIDI_OUT"),
+                    help="port to send on: index, instrument short form, or any "
+                         "fragment of the port name; env SCREENDUMP_MIDI_OUT")
+    ap.add_argument("--midi-in", default=os.environ.get("SCREENDUMP_MIDI_IN"),
+                    help="port to listen on: index, instrument short form, or "
+                         "any fragment of the port name; env SCREENDUMP_MIDI_IN")
+
+    ap.add_argument("--blocks", action="store_true",
+                    help="half-block rendering, no row gaps; best for reading")
+    ap.add_argument("--ascii", action="store_true", help="full-resolution ASCII")
+    ap.add_argument("--invert", action="store_true", help="swap lit and unlit")
+    ap.add_argument("--flip", action="store_true",
+                    help="flip vertically (escape hatch; not needed on verified "
+                         "instruments)")
+
+    ap.add_argument("--save-syx", metavar="PATH",
+                    help="also write the raw SysEx reply (self-describing; "
+                         "prefer this for anything you keep)")
+    ap.add_argument("--save-raw", metavar="PATH",
+                    help="also write the raw pixel bytes")
+    ap.add_argument("--timeout", type=float, default=2.0,
+                    help="reply timeout in seconds (default 2)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    if args.list_midi:
+        list_midi()
+        return 0
+
+    # Every other mode needs to know which instrument it is talking about.
+    if not args.instrument:
+        die("no instrument selected. Pass --instrument or set "
+            "SCREENDUMP_INSTRUMENT.\n  implemented:\n"
+            + instrument_table(implemented()))
+
+    inst = find_instrument(args.instrument)
+    if inst is None:
+        guess = near_miss(args.instrument)
+        if guess is not None:
+            die(f"{args.instrument!r} is not an accepted spelling. For the "
+                f"{guess.name}, write one of:\n" + instrument_table([guess]))
+        die(f"{args.instrument!r} is not an Elektron instrument I know.\n"
+            "  implemented:\n" + instrument_table(implemented())
+            + "\n  known, not implemented:\n"
+            + instrument_table(not_implemented()))
+    if not inst.implemented:
+        die(f"The {inst.name} is not implemented for screendump yet.\n"
+            "    No instrument id is known for it, so there is no request to "
+            "send -- it is not merely untested, it is unreachable.\n"
+            "  implemented:\n" + instrument_table(implemented()))
+
+    if args.self_test:
+        return self_test(args, inst)
+
+    if args.emit_sample:
+        frame = build_response(inst, pack(synthetic_grid(inst),
+                                          inst.width, inst.height))
+        with open(args.emit_sample, "wb") as fh:
+            fh.write(frame)
+        warn(f"wrote {len(frame)} B synthetic frame to {args.emit_sample}")
+        return 0
+
+    if args.bench:
+        return bench(inst, args)
+
+    if args.external:
+        replies, _ = capture(inst, args.midi_out, args.midi_in,
+                             args.timeout, verbose=args.verbose)
+        raw = replies[0]
+        if args.save_syx:
+            with open(args.save_syx, "wb") as fh:
+                fh.write(raw)
+        width, height, pixels = parse_or_die(raw, inst)
+    else:
+        try:
+            blob = open(args.from_file, "rb").read()
+        except OSError as exc:
+            die(str(exc))
+        if blob[:1] == bytes([SYSEX_START]):
+            width, height, pixels = parse_or_die(blob, inst)
+        else:
+            expected = inst.width * ((inst.height + 31) // 32) * 4
+            if len(blob) != expected:
+                die(f"{args.from_file}: not a SysEx frame, and not {expected} "
+                    f"raw bytes for a {inst.name} ({len(blob)} B).\n"
+                    f"    A raw dump carries no header, so it is only readable "
+                    f"with the instrument it came from.")
+            width, height, pixels = inst.width, inst.height, blob
+
+    if args.save_raw:
+        with open(args.save_raw, "wb") as fh:
+            fh.write(pixels)
+
+    print(render(unpack(pixels, width, height, args.flip), args))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
