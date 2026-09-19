@@ -52,8 +52,18 @@ A real 128 × 64 screen, unretouched — the Digitakt's SRC page, with `LEV`,
 pip install python-rtmidi
 ```
 
-That is the only dependency. `screendump` is a single file: put it on your
-`PATH` and make it executable, or simply run it from the repo.
+`screendump` is a single file: put it on your `PATH` and make it executable, or
+simply run it from the repo.
+
+That one package is all you need to see a screen. Two more things are needed
+only if you want sound and video, and each is named when it is missing, so
+nothing has to be installed up front:
+
+| for | install |
+|---|---|
+| the screen, recording, GIF | `pip install python-rtmidi` |
+| `--save-audio` | `pip install sounddevice` |
+| `--save-video` | ffmpeg — `brew install ffmpeg`, `apt install ffmpeg`, `winget install ffmpeg` |
 
 ## Find your MIDI ports
 
@@ -131,6 +141,81 @@ $ screendump --from-file cap.mid --save-gif out.gif
 A `.mid` keeps every frame and its timing, so you can come back to a recording
 and re-cut it without touching the instrument again.
 
+## Sound, and video
+
+A GIF shows what the instrument is doing. For what it *sounds* like you need
+video, which means recording the audio at the same time.
+
+Find the audio input the same way as the MIDI ports:
+
+```
+$ screendump --list-audio
+Audio inputs (instrument -> computer):
+  [0] MacBook Air Microphone (Core Audio)   1 ch   48000 Hz
+  [1] Elektron Digitakt (Core Audio)   2 ch   48000 Hz
+```
+
+`--audio-in` takes an index, an instrument short form, or any fragment of the
+name — exactly like `--midi-in`. The host API is part of the name because the
+same interface is listed once per host API on Windows, so `--audio-in
+"Digitakt (WASAPI)"` is a way to pick one when several match.
+
+**Record picture and sound together:**
+
+```
+$ screendump -x --framerate 30 --audio-in dt \
+             --save-mid cap.mid --save-audio cap.wav
+```
+
+**Then turn the pair into a video:**
+
+```
+$ screendump --from-file cap.mid --from-audio cap.wav --save-video out.mp4
+```
+
+Video takes **two** inputs, because the two halves are recorded separately: a
+`.mid` holds the picture and its timing, a `.wav` holds the sound. They line up
+without you doing anything — the capture's clock starts at the first audio
+sample, so both files share an origin.
+
+Or do it in one go, and skip the intermediate files:
+
+```
+$ screendump -x --framerate 30 --audio-in dt --save-video out.mp4
+```
+
+`--video-scale` sets how much each pixel is enlarged (default 4, so a 128 × 64
+screen becomes 512 × 256). Scaling is nearest-neighbour on purpose: a 1-bit
+screen through a smoothing filter turns to mush.
+
+⚠️ **The first recording will ask for microphone permission** on macOS — that is
+the OS gate on *any* audio input, including an instrument. If you refuse it, the
+recording silently comes out empty.
+
+**Why `.mid` and not the GIF?** A GIF has already rounded its timing to
+hundredths of a second, and a raw dump is a single frame with no timing at all.
+The `.mid` is the only format that knows when each frame appeared, so it is the
+only one that can drive a video.
+
+### If sound and picture drift apart
+
+Every recording prints what the audio clock actually did:
+
+```
+screendump: audio: 1438720 samples, 30.0 s, 0 overflows
+screendump: audio clock: 47999.2 Hz measured vs 48000 Hz nominal (-17 ppm, +11 ms over this capture)
+```
+
+An interface that says 48000 Hz is really a crystal a few tens of parts per
+million away from that, while the frame times come from the computer's clock.
+The two disagree slowly — a few milliseconds a minute — so the figure is
+measured and printed rather than assumed. On a short capture it does not matter.
+On a long one, that last number is how far the sound has slid against the
+picture.
+
+`0 overflows` is the other number to glance at. Anything above zero means
+samples were **dropped**, and the recording is short by that much.
+
 **Why `.mid` rather than `.syx`?** Timing. A `.syx` is a bare run of `F0 … F7`
 messages with nowhere to put it. A Standard MIDI File gives every event a delta,
 so the recording keeps its real pacing and stays readable by other MIDI tools.
@@ -144,6 +229,7 @@ shows.
 ```
 $ export SCREENDUMP_MIDI_IN=0
 $ export SCREENDUMP_MIDI_OUT=0
+$ export SCREENDUMP_AUDIO_IN=dt
 $ export SCREENDUMP_INSTRUMENT=dt
 
 $ screendump -x
@@ -163,7 +249,9 @@ An option always beats the environment. Setting variables differs by shell:
 |---|---|
 | `-x`, `--external` | capture from the instrument |
 | `--list-midi` | list MIDI ports |
+| `--list-audio` | list audio inputs |
 | `--midi-in`, `--midi-out` | port index or name fragment |
+| `--audio-in` | audio input index or name fragment |
 | `--instrument` | which machine — required, no default |
 | `--blocks` | half-block rendering, no row gaps |
 | `--ascii` | full resolution, one character per pixel |
@@ -174,7 +262,11 @@ An option always beats the environment. Setting variables differs by shell:
 | `--save-raw PATH` | also save just the pixel bytes |
 | `--save-mid PATH` | also save the recording, with timing, as a MIDI file |
 | `--save-gif PATH` | also save an animated GIF |
+| `--save-audio PATH` | also record the instrument's audio to a stereo WAV |
+| `--save-video PATH` | write an mp4 of picture and sound together |
+| `--video-scale N` | enlarge each pixel to N × N in the video (default 4) |
 | `--from-file PATH` | render a saved `.syx`, `.mid` or raw dump instead |
+| `--from-audio PATH` | the `.wav` to pair with `--from-file` for a video |
 | `--bench N` | measure the frame rate over N captures |
 | `--self-test` | check the tool without an instrument |
 | `--timeout` | reply timeout in seconds, default 2 |

@@ -8,6 +8,8 @@ AGENTS.md
 
 *.mid
 *.gif
+*.wav
+*.mp4
 
 .DS_Store
 __pycache__/

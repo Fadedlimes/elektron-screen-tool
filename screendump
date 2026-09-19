@@ -10,17 +10,29 @@
     screendump -x --framerate 30 --save-mid cap.mid    record while watching
     screendump --from-file cap.mid --save-gif out.gif  turn it into a GIF
 
+    screendump --list-audio                            audio inputs
+    screendump -x --framerate 30 --audio-in dt \
+               --save-mid cap.mid --save-audio cap.wav  record picture + sound
+    screendump --from-file cap.mid --from-audio cap.wav \
+               --save-video out.mp4                     mux them into a video
+
 Recording keeps only the frames that actually changed, with the time each one
 was on screen. That timing needs a Standard MIDI File: a .syx is a bare run of
 messages with nowhere to put time. Pass --save-gif while streaming to get the
 GIF directly, or from a .mid afterwards.
+
+Video needs both halves, so it takes two inputs: --from-file for the picture and
+--from-audio for the sound. A .mid is the only frame format that can drive one,
+because it is the only one that records when each frame appeared -- a GIF has
+already rounded its timing to hundredths, and a raw dump is a single frame with
+no timing at all.
 
 Ports are whatever --list-midi reports, given either as an index or as part
 of a port name. Indices are quickest; a name fragment survives replugging other
 gear, which can renumber the list.
 
 Writes to stdout, so it pipes and tees like anything else. Nothing is written to
-disk unless you ask with --save-syx / --save-raw.
+disk unless you ask for it.
 
 Set these once per terminal session and then run bare with -x:
 
@@ -33,15 +45,23 @@ way everywhere, but the shell syntax to set them is not:
     PowerShell          $env:SCREENDUMP_MIDI_IN = "0"
     cmd.exe             set SCREENDUMP_MIDI_IN=0
 
-Requires python-rtmidi. The command is the same everywhere; only Linux may need
+Dependencies come in three tiers, and only the first is needed to see a screen:
+
+    the screen        pip install python-rtmidi
+    --save-audio      pip install sounddevice
+    --save-video      ffmpeg on PATH (or SCREENDUMP_FFMPEG=/path/to/ffmpeg)
+
+Each is reported by name when it is missing, so nothing has to be installed
+speculatively. The pip commands are the same everywhere; only Linux may need
 system packages first, if pip has no wheel for your Python and falls back to
 building from source:
 
-    macOS       pip install python-rtmidi
-    Windows     pip install python-rtmidi
-    Linux       pip install python-rtmidi
-                needs ALSA headers if it builds from source --
-                libasound2-dev (Debian/Ubuntu), alsa-lib-devel (Fedora)
+    macOS       pip install python-rtmidi sounddevice
+    Windows     pip install python-rtmidi sounddevice
+    Linux       pip install python-rtmidi sounddevice
+                python-rtmidi needs ALSA headers if it builds from source --
+                libasound2-dev (Debian/Ubuntu), alsa-lib-devel (Fedora);
+                sounddevice needs PortAudio -- libportaudio2
 """
 
 # ---------------------------------------------------------------------------
@@ -91,8 +111,12 @@ building from source:
 
 import argparse
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
+import wave
 
 SYSEX_START = 0xF0
 SYSEX_END = 0xF7
@@ -412,9 +436,15 @@ def _read_varlen(buf, i):
 
 
 def write_smf(path, frames, end_ms):
-    """frames = [(sysex bytes, start_ms)], end_ms = when capture stopped."""
+    """frames = [(sysex bytes, start_ms)], end_ms = when capture stopped.
+
+    ⭐ The timeline starts at CAPTURE zero, not at the first frame. The few tens
+    of milliseconds before the first frame arrives are real elapsed time, and
+    when a .wav was recorded alongside, that zero is the first audio sample --
+    so the two files line up with nothing written down to say how.
+    """
     track = bytearray(b"\x00\xff\x51\x03" + SMF_TEMPO.to_bytes(3, "big"))
-    prev = frames[0][1] if frames else 0
+    prev = 0
     for raw, start in frames:
         track += _varlen(max(0, int(start - prev)))
         prev = start
@@ -613,6 +643,352 @@ def write_animation(path, timed, instrument, args):
     warn(f"wrote {len(grids)} frames ({sum(delays) / 1000:.1f} s) to {path}")
 
 
+# ------------------------------------------------------------------- AUDIO
+#
+# Sound is what makes video worth having: the picture alone shows what the
+# instrument is doing, not what it sounds like.
+#
+# Audio arrives on a clock of its own. An interface that calls itself 48000 Hz is
+# really running a crystal a few tens of parts per million away from that, while
+# frame timestamps come from time.monotonic(). Fifty ppm is three milliseconds a
+# minute -- nothing over a short capture, a visible lip-sync error over a long
+# one. So rather than assume either way, the recorder counts the samples that
+# actually arrived against the elapsed time and reports the rate it measured.
+#
+# ⚠️ The .wav is written at the NOMINAL rate: it is a recording of the instrument
+# before it is half of a video, and a WAV header has nowhere to say "48002 Hz,
+# measured". The measured figure is printed instead, so a capture that drifts
+# says so in a number rather than sliding quietly out of sync.
+#
+# One dependency, sounddevice, which wraps the platform audio API the way
+# python-rtmidi wraps the platform MIDI API. Its RAW stream interface is used
+# deliberately -- the numpy-flavoured one would pull in numpy for nothing, since
+# these samples go straight to a file without ever being looked at.
+
+
+def samples_per_second(marks):
+    """Least-squares slope through (monotonic time, samples so far) marks.
+
+    One mark per callback. The fit is what makes the figure usable: callback
+    scheduling jitters by a few milliseconds, and over a short capture that is
+    far larger than the tens of parts per million being looked for, so the first
+    and last marks alone would mostly measure the jitter.
+    """
+    if len(marks) < 3:
+        return 0.0
+    base = marks[0][0]
+    n = len(marks)
+    sx = sy = sxx = sxy = 0.0
+    for when, count in marks:
+        x = when - base
+        sx += x
+        sy += count
+        sxx += x * x
+        sxy += x * count
+    denom = n * sxx - sx * sx
+    return (n * sxy - sx * sy) / denom if denom > 0 else 0.0
+
+
+def _sounddevice():
+    try:
+        import sounddevice
+    except ImportError:
+        die("sounddevice is not installed -- it is what records audio.\n"
+            "    pip install sounddevice")
+    except OSError as exc:
+        die(f"sounddevice could not load PortAudio: {exc}\n"
+            "    Linux: apt install libportaudio2 (or your distribution's "
+            "portaudio package)")
+    return sounddevice
+
+
+def audio_inputs():
+    """Devices we could record from, in this tool's own numbering.
+
+    ⚠️ The same interface is enumerated ONCE PER HOST API -- on Windows a
+    Digitakt appears under MME, WASAPI and DirectSound alike -- which would make
+    every sensible name ambiguous. The host API is therefore part of the name
+    here rather than a separate column, which keeps one spelling rule for every
+    port in the tool: a fragment of the name picks the device, and the fragment
+    can name the host API when that is the thing telling two entries apart.
+    """
+    sd = _sounddevice()
+    apis = sd.query_hostapis()
+    devices = []
+    for idx, dev in enumerate(sd.query_devices()):
+        if dev["max_input_channels"] < 1:
+            continue
+        devices.append({
+            "device": idx,
+            "name": f"{dev['name']} ({apis[dev['hostapi']]['name']})",
+            "hostapi": dev["hostapi"],
+            "channels": int(dev["max_input_channels"]),
+            "rate": float(dev["default_samplerate"]),
+        })
+    return devices
+
+
+def default_hostapi():
+    """Index of the host API the system would pick by default, or None."""
+    sd = _sounddevice()
+    try:
+        idx = sd.default.device[0]
+        if idx is not None and idx >= 0:
+            return sd.query_devices(idx)["hostapi"]
+    except Exception:
+        pass
+    return None
+
+
+def list_audio():
+    devices = audio_inputs()
+    print("Audio inputs (instrument -> computer):")
+    for i, dev in enumerate(devices):
+        print(f"  [{i}] {dev['name']}   "
+              f"{dev['channels']} ch   {dev['rate']:.0f} Hz")
+    if not devices:
+        print("  (none)")
+
+
+def resolve_audio_in(spec, devices):
+    default_api = default_hostapi()
+
+    def same_default_api(i):
+        return devices[i]["hostapi"] == default_api
+
+    return resolve_port(spec, [d["name"] for d in devices], "audio-in",
+                        listing="--list-audio",
+                        tiebreak=None if default_api is None else same_default_api)
+
+
+class AudioRecorder:
+    """Records one input while the screen is being polled.
+
+    ⭐ The FIRST CALLBACK fixes the zero point of the whole capture. Frame
+    timestamps are measured from the moment the first audio sample was taken, so
+    the .wav and the .mid share an origin BY CONSTRUCTION and neither file has to
+    carry an offset to the other.
+
+    That moment is estimated rather than observed: a callback runs once its
+    buffer is already full, so the buffer's own duration and the device's input
+    latency are subtracted back off. What is left is a millisecond or two, well
+    inside a single 33 ms frame.
+    """
+
+    def __init__(self, device, channels, samplerate):
+        sd = _sounddevice()
+        self.channels = channels
+        self.samplerate = samplerate
+        self.chunks = []
+        self.samples = 0
+        self.overflows = 0
+        self.t0 = None
+        self.lag = 0.0
+        self._marks = []          # (monotonic, samples so far) per callback
+        self._stream = sd.RawInputStream(
+            device=device, channels=channels, samplerate=samplerate,
+            dtype="int16", callback=self._take)
+        latency = self._stream.latency
+        self._latency = float(latency[0] if isinstance(latency, (tuple, list))
+                              else latency)
+
+    def _take(self, indata, frames, time_info, status):
+        now = time.monotonic()
+        if self.t0 is None:
+            # ⚠️ How long ago the first sample in this buffer reached the
+            # converter. PortAudio knows exactly, and its own reported LATENCY
+            # already includes the buffering -- subtracting the buffer as well,
+            # as an earlier version did, counts it twice and puts the whole
+            # recording that much ahead of the picture.
+            adc = getattr(time_info, "inputBufferAdcTime", 0.0) or 0.0
+            cur = getattr(time_info, "currentTime", 0.0) or 0.0
+            self.lag = (cur - adc) if cur > adc > 0 else self._latency
+            self.t0 = now - self.lag
+        if status.input_overflow:
+            self.overflows += 1
+        self.chunks.append(bytes(indata))
+        self.samples += frames
+        self._marks.append((now, self.samples))
+
+    def start(self, wait_s=2.0):
+        """Start the stream and block until the first samples actually arrive."""
+        self._stream.start()
+        deadline = time.monotonic() + wait_s
+        while self.t0 is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+        if self.t0 is None:
+            self.stop()
+            die("the audio device opened but delivered no samples.\n"
+                "    Check it is the instrument's own input, and that nothing "
+                "else holds it.\n    screendump --list-audio")
+        return self.t0
+
+    def stop(self):
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception:
+            pass
+
+    @property
+    def seconds(self):
+        return self.samples / self.samplerate if self.samplerate else 0.0
+
+    def measured_rate(self):
+        """Samples per second, as the callbacks actually delivered them.
+
+        ⚠️ Measured BETWEEN CALLBACKS, never from the start of the capture to the
+        end of the poll loop. Audio arrives buffered, so when polling stops the
+        last buffer's worth is still in flight and has not been handed over --
+        charging that against elapsed time reads as a huge negative drift, an
+        artefact of the measurement rather than anything the clock did. Every
+        callback carries the same delay, so taking both ends from callbacks makes
+        it cancel exactly.
+
+        The slope comes from a least-squares fit over every callback rather than
+        from the first and last alone: callback scheduling jitters by a few
+        milliseconds, which over a short capture is far bigger than the tens of
+        parts per million being looked for.
+        """
+        return samples_per_second(self._marks)
+
+    def drift_ms(self):
+        """How much LONGER the .wav plays than the sound really lasted.
+
+        Positive means the audio runs long against the picture: the file is
+        tagged with the nominal rate, but the device delivered samples slightly
+        faster than that.
+        """
+        measured = self.measured_rate()
+        if not measured or not self.samplerate:
+            return 0.0
+        return (self.samples / self.samplerate - self.samples / measured) * 1000.0
+
+    def write_wav(self, path):
+        with wave.open(path, "wb") as fh:
+            fh.setnchannels(self.channels)
+            fh.setsampwidth(2)                       # int16
+            fh.setframerate(int(round(self.samplerate)))
+            fh.writeframes(b"".join(self.chunks))
+        return self.samples
+
+
+def open_recorder(spec, verbose=False):
+    """Resolve an --audio-in spec and build a recorder for it."""
+    devices = audio_inputs()
+    if not devices:
+        die("no audio inputs found.\n    screendump --list-audio")
+    dev = devices[resolve_audio_in(spec, devices)]
+    channels = min(2, dev["channels"])               # stereo for now
+    if verbose:
+        warn(f"audio <- {dev['name']}  {channels} ch  {dev['rate']:.0f} Hz")
+    return AudioRecorder(dev["device"], channels, dev["rate"])
+
+
+# ------------------------------------------------------------------- VIDEO
+#
+# A capture is VARIABLE frame rate by design -- only frames that changed are
+# kept -- but every one of them was taken on the instrument's own 30 Hz tick, so
+# expanding back to a constant rate restores what was there rather than
+# resampling it. Each output frame asks which captured frame was on screen at its
+# own timestamp, computed from ABSOLUTE time rather than by repeating frames a
+# counted number of times: rounding then cannot accumulate over a long recording.
+#
+# Encoding is ffmpeg's job -- writing an MP4 muxer and an H.264 encoder here
+# would be absurd. It is needed ONLY for --save-video; everything else in the
+# tool still runs with python-rtmidi alone.
+#
+# ⚠️ Nearest-neighbour scaling is not a preference. A 1-bit 128x64 screen put
+# through any smoothing filter turns to porridge, so each pixel is expanded into
+# a solid square here, before ffmpeg sees it.
+
+
+def _ffmpeg():
+    exe = os.environ.get("SCREENDUMP_FFMPEG") or shutil.which("ffmpeg")
+    if not exe:
+        die("ffmpeg was not found on PATH -- it is what writes the video.\n"
+            "    macOS    brew install ffmpeg\n"
+            "    Linux    apt install ffmpeg\n"
+            "    Windows  winget install ffmpeg\n"
+            "    Or point SCREENDUMP_FFMPEG at it.")
+    return exe
+
+
+def cfr_indices(starts, end_ms, fps):
+    """Which captured frame each frame of a constant-rate video should show.
+
+    A frame appears from the first output frame at or after its start time, so a
+    frame starting at 237 ms is not yet showing at output frame 7 (233.3 ms) and
+    arrives at frame 8.
+
+    The first captured frame is held back to t=0 rather than leaving the few tens
+    of milliseconds before it black. That lead-in is the time the first request
+    took to come back, and opening on the screen is better than opening on a
+    flash of nothing.
+    """
+    count = max(1, int(round(end_ms * fps / 1000.0)))
+    out, k = [], 0
+    for n in range(count):
+        t = n * 1000.0 / fps
+        while k + 1 < len(starts) and starts[k + 1] <= t:
+            k += 1
+        out.append(k)
+    return out
+
+
+def frame_bytes(grid, scale, invert=False):
+    """One grid as 8-bit grayscale, each pixel a solid scale x scale square."""
+    lit, dark = b"\xff" * scale, b"\x00" * scale
+    out = bytearray()
+    for row in grid:
+        line = bytearray()
+        for px in row:
+            line += dark if (bool(px) == bool(invert)) else lit
+        out += bytes(line) * scale
+    return bytes(out)
+
+
+def write_video(path, frames, end_ms, instrument, args, audio_path=None):
+    """frames = [(sysex bytes, start_ms)] -> an mp4, with sound if given."""
+    exe = _ffmpeg()
+    fps = max(1, min(60, args.framerate or 30))
+    scale = max(1, args.video_scale)
+    order = cfr_indices([start for _, start in frames], end_ms, fps)
+
+    w, h, _ = parse_or_die(frames[0][0], instrument)
+    width, height = w * scale, h * scale
+
+    cmd = [exe, "-y", "-loglevel", "error",
+           "-f", "rawvideo", "-pix_fmt", "gray",
+           "-s", f"{width}x{height}", "-r", str(fps), "-i", "-"]
+    if audio_path:
+        cmd += ["-i", audio_path, "-c:a", "aac", "-b:a", "192k", "-shortest"]
+    cmd += ["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",   # H.264 wants even sides
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-preset", "veryfast", "-crf", "18", path]
+
+    # `order` never decreases, so the frame on screen only has to be redrawn when
+    # it actually changes -- one render per KEPT frame, not per output frame.
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    shown, buf = -1, b""
+    try:
+        for idx in order:
+            if idx != shown:
+                _, _, px = parse_or_die(frames[idx][0], instrument)
+                buf = frame_bytes(unpack(px, w, h, args.flip), scale, args.invert)
+                shown = idx
+            proc.stdin.write(buf)
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    if proc.wait() != 0:
+        die(f"ffmpeg failed while writing {path}")
+    warn(f"wrote {len(order)} frames ({len(order) / fps:.1f} s) at {fps} fps, "
+         f"{width}x{height}, "
+         + ("with audio" if audio_path else "SILENT")
+         + f" to {path}")
+
+
 # -------------------------------------------------------------------- MIDI
 
 def _rtmidi():
@@ -648,24 +1024,30 @@ def list_midi():
         print("  (none)")
 
 
-def resolve_port(spec, names, what):
+def resolve_port(spec, names, what, listing="--list-midi", tiebreak=None):
     """Resolve a port spec to an index.
 
-    Accepts an ordinal from --list-midi, an instrument short form (dt, dtii),
-    or any fragment of a port name. A fragment must identify exactly one port:
+    Accepts an ordinal from the listing, an instrument short form (dt, dtii), or
+    any fragment of a port name. A fragment must identify exactly one port:
     picking for you when two match would be the wrong kind of helpful.
+
+    Every port in the tool is spelled the same way, which is why this is one
+    function rather than one per kind. `tiebreak` is the single concession to how
+    AUDIO devices are enumerated -- the same interface appears once per host API,
+    so an otherwise ambiguous name is narrowed to the default host API before
+    giving up. MIDI ports pass nothing and behave exactly as before.
     """
-    listing = "\n".join(f"    [{i}] {n}" for i, n in enumerate(names)) or "    (none)"
+    table = "\n".join(f"    [{i}] {n}" for i, n in enumerate(names)) or "    (none)"
 
     if spec is None:
         die(f"no {what} selected -- pass --{what} or set "
             f"SCREENDUMP_{what.upper().replace('-', '_')}.\n"
-            f"    screendump --list-midi")
+            f"    screendump {listing}")
 
     if spec.strip().lstrip("+-").isdigit():
         idx = int(spec)
         if not 0 <= idx < len(names):
-            die(f"{what} index {idx} is out of range.\n{listing}")
+            die(f"{what} index {idx} is out of range.\n{table}")
         return idx
 
     # an instrument short form stands in for its full name
@@ -674,13 +1056,17 @@ def resolve_port(spec, names, what):
 
     matches = [i for i, n in enumerate(names) if needle.lower() in n.lower()]
     if not matches:
-        die(f"no {what} port matches {needle!r}.\n{listing}")
+        die(f"no {what} port matches {needle!r}.\n{table}")
+    if len(matches) > 1 and tiebreak is not None:
+        narrowed = [i for i in matches if tiebreak(i)]
+        if len(narrowed) == 1:
+            return narrowed[0]
     if len(matches) > 1:
         die(f"{needle!r} does not uniquely identify a {what} port "
             f"-- {len(matches)} match:\n"
             + "\n".join(f"    [{i}] {names[i]}" for i in matches)
             + "\n    Give the index instead, or a longer fragment.\n"
-              "    screendump --list-midi")
+              f"    screendump {listing}")
     return matches[0]
 
 
@@ -757,11 +1143,16 @@ def _enable_ansi_on_windows():
         pass
 
 
-def stream(instrument, args):
+def stream(instrument, args, recorder=None):
     """Live view: poll, redraw in place, and log the frames that differ.
 
     Ctrl+C stops. The last frame is given its duration at that point, so a
     recording made here is complete rather than truncated.
+
+    ⭐ When a recorder is passed, the capture's zero is the first AUDIO SAMPLE,
+    not the first poll: the stream is started and waited on before the loop
+    begins, and every frame timestamp is measured from there. That is what makes
+    the .wav and the .mid line up without either one storing an offset.
     """
     _enable_ansi_on_windows()
     fps = max(1, min(30, args.framerate))
@@ -775,7 +1166,7 @@ def stream(instrument, args):
         warn("stdout is not a terminal -- streaming without drawing")
     picture = ""
     misses = 0
-    t0 = time.monotonic()
+    t0 = recorder.start() if recorder is not None else time.monotonic()
 
     # The ALTERNATE SCREEN is what makes this behave like a proper full-screen
     # tool: the live view never enters the scrollback, and on exit the terminal
@@ -813,6 +1204,9 @@ def stream(instrument, args):
     except KeyboardInterrupt:
         pass
     finally:
+        end_mono = time.monotonic()
+        if recorder is not None:
+            recorder.stop()
         if drawing:
             sys.stdout.write("\033[?25h\033[?1049l")
             sys.stdout.flush()
@@ -820,7 +1214,7 @@ def stream(instrument, args):
         midi_out.close_port()
         del midi_in, midi_out
 
-    end_ms = (time.monotonic() - t0) * 1000.0
+    end_ms = (end_mono - t0) * 1000.0
     if not log.frames:
         die("no frames captured.\n" + TIMEOUT_HINT)
     # leave the last frame behind, so the session ends with something to look at
@@ -828,7 +1222,30 @@ def stream(instrument, args):
     if drawing and picture:
         print(picture)
     warn(f"{log.polled} polled, {len(log.frames)} kept, {end_ms / 1000:.1f} s")
+    if recorder is not None:
+        report_audio(recorder, args.verbose)
     return log, end_ms
+
+
+def report_audio(recorder, verbose=False):
+    """What the audio clock actually did, rather than what it claims to do."""
+    measured = recorder.measured_rate()
+    drift = recorder.drift_ms()
+    ppm = (measured / recorder.samplerate - 1) * 1e6 if recorder.samplerate else 0
+    warn(f"audio: {recorder.samples} samples, {recorder.seconds:.1f} s, "
+         f"{recorder.overflows} overflow{'' if recorder.overflows == 1 else 's'}")
+    warn(f"audio clock: {measured:.1f} Hz measured vs "
+         f"{recorder.samplerate:.0f} Hz nominal "
+         f"({ppm:+.0f} ppm, {drift:+.0f} ms over this capture)")
+    if verbose:
+        warn(f"audio lag: {recorder.lag * 1000:.0f} ms from converter to "
+             f"callback -- the picture is aligned back across this")
+    if recorder.overflows:
+        warn("    ⚠️ overflows mean samples were DROPPED -- the recording is "
+             "short by that much and will drift against the picture.")
+    if abs(ppm) > 1000:
+        warn("    ⚠️ that is far too large to be a crystal. Suspect the "
+             "measurement, or a device that resampled on the way in.")
 
 
 def parse_or_die(raw, instrument):
@@ -933,6 +1350,68 @@ def self_test(args, inst):
         print("FAIL: request body has a high bit set"); ok = False
     print(f"request frame:  {len(req)} B  {req.hex(' ')}")
 
+    # Constant-rate expansion: three frames at 0, 100 and 250 ms over 400 ms of
+    # capture, played at 10 fps, must land on 0 / 100 / 200 / 300 ms and show
+    # frames 0, 1, 1, 2. The last output frame is the one that catches an
+    # off-by-one at the end of a recording.
+    idxs = cfr_indices([0, 100, 250], 400, 10)
+    if idxs != [0, 1, 1, 2]:
+        print(f"FAIL: cfr_indices gave {idxs}, expected [0, 1, 1, 2]"); ok = False
+    elif any(b < a for a, b in zip(idxs, idxs[1:])):
+        print("FAIL: cfr_indices went backwards"); ok = False
+    else:
+        print(f"video timing:   {len(idxs)} output frames from 3 captured")
+
+    # The audio clock estimator, on marks that say exactly what the answer is:
+    # a device running 48050 Hz, delivering 1024 samples a callback, with two
+    # milliseconds of scheduling jitter sprinkled on the timestamps. Recovering
+    # the rate through the jitter is the whole point of fitting a line.
+    true_rate, block = 48050.0, 1024
+    marks, jitter = [], 0.0
+    for i in range(1, 400):
+        jitter = ((i * 7919) % 1000) / 1000.0 * 0.002
+        marks.append((i * block / true_rate + jitter, i * block))
+    got = samples_per_second(marks)
+    if abs(got - true_rate) > 5.0:
+        print(f"FAIL: audio clock fit gave {got:.1f} Hz, expected "
+              f"{true_rate:.0f}"); ok = False
+    elif samples_per_second(marks[:2]) != 0.0:
+        print("FAIL: audio clock fit should refuse too few marks"); ok = False
+    else:
+        print(f"audio clock:    {got:.1f} Hz recovered from {true_rate:.0f} Hz "
+              f"+/- 2 ms jitter")
+
+    scale = 3
+    blob = frame_bytes(grid, scale)
+    want = inst.width * inst.height * scale * scale
+    if len(blob) != want:
+        print(f"FAIL: frame_bytes gave {len(blob)} B, expected {want}"); ok = False
+    elif blob[:scale] != (b"\xff" * scale if grid[0][0] else b"\x00" * scale):
+        print("FAIL: frame_bytes did not preserve the top-left pixel"); ok = False
+    else:
+        print(f"video frame:    {inst.width * scale}x{inst.height * scale}, "
+              f"{len(blob)} B grayscale")
+
+    # The WAV writer is stdlib, but the header fields are ours to get wrong.
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp.close()
+    try:
+        pcm = bytes(range(256)) * 8
+        with wave.open(tmp.name, "wb") as fh:
+            fh.setnchannels(2)
+            fh.setsampwidth(2)
+            fh.setframerate(48000)
+            fh.writeframes(pcm)
+        with wave.open(tmp.name, "rb") as fh:
+            same = (fh.getnchannels(), fh.getsampwidth(), fh.getframerate())
+            back = fh.readframes(fh.getnframes())
+        if same != (2, 2, 48000) or back != pcm:
+            print(f"FAIL: WAV round trip changed {same} or its samples"); ok = False
+        else:
+            print(f"wav round trip: 2 ch, 16 bit, 48000 Hz, {len(pcm)} B")
+    finally:
+        os.unlink(tmp.name)
+
     print()
     print(render(unpack(px, w, h, args.flip), args))
     print()
@@ -964,6 +1443,8 @@ def main():
                       help="render a saved .syx frame, or a raw pixel dump")
     mode.add_argument("--list-midi", action="store_true",
                       help="list MIDI ports as the system reports them")
+    mode.add_argument("--list-audio", action="store_true",
+                      help="list audio inputs as the system reports them")
     mode.add_argument("--self-test", action="store_true",
                       help="verify the codec and renderer, no instrument needed")
     mode.add_argument("--emit-sample", metavar="PATH",
@@ -986,6 +1467,10 @@ def main():
     ap.add_argument("--midi-in", default=os.environ.get("SCREENDUMP_MIDI_IN"),
                     help="port to listen on: index, instrument short form, or "
                          "any fragment of the port name; env SCREENDUMP_MIDI_IN")
+    ap.add_argument("--audio-in", default=os.environ.get("SCREENDUMP_AUDIO_IN"),
+                    help="audio input to record: index, instrument short form, "
+                         "or any fragment of the device name; "
+                         "env SCREENDUMP_AUDIO_IN")
 
     ap.add_argument("--blocks", action="store_true",
                     help="half-block rendering, no row gaps; best for reading")
@@ -1014,6 +1499,19 @@ def main():
     ap.add_argument("--save-gif", metavar="PATH",
                     help="also write an animated GIF; works while streaming, or "
                          "from a .mid with --from-file")
+    ap.add_argument("--save-audio", metavar="PATH",
+                    help="also record the instrument's audio to a stereo WAV "
+                         "while streaming; needs --audio-in")
+    ap.add_argument("--save-video", metavar="PATH",
+                    help="write an mp4 of picture and sound together; while "
+                         "streaming, or from a .mid with --from-file plus "
+                         "--from-audio. Needs ffmpeg")
+    ap.add_argument("--from-audio", metavar="PATH",
+                    help="the .wav to pair with --from-file when writing a "
+                         "video -- a .mid holds the picture, never the sound")
+    ap.add_argument("--video-scale", type=int, default=4, metavar="N",
+                    help="enlarge each pixel to an N x N square in the video "
+                         "(default 4, so 128x64 becomes 512x256)")
     ap.add_argument("--timeout", type=float, default=2.0,
                     help="reply timeout in seconds (default 2)")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -1022,6 +1520,24 @@ def main():
     if args.list_midi:
         list_midi()
         return 0
+
+    if args.list_audio:
+        list_audio()
+        return 0
+
+    # Combinations that cannot mean anything, caught before a port is opened or
+    # an instrument is contacted -- an argument error should never cost MIDI.
+    if args.save_audio and not (args.external and args.framerate):
+        die("--save-audio records while streaming, so it needs -x --framerate."
+            "\n    A single screenshot is one instant; there is no sound to go "
+            "with it.")
+    if args.save_audio and not args.audio_in:
+        die("--save-audio needs --audio-in to say which device to record.\n"
+            "    screendump --list-audio")
+    if args.from_audio and not args.save_video:
+        die("--from-audio is only used when writing a video with --save-video.")
+    if args.save_video and args.from_file and not args.from_audio:
+        warn("no --from-audio given -- the video will be silent")
 
     # Every other mode needs to know which instrument it is talking about.
     if not args.instrument:
@@ -1060,12 +1576,40 @@ def main():
         return bench(inst, args)
 
     if args.external and args.framerate:
-        log, end_ms = stream(inst, args)
+        recorder = None
+        if args.audio_in and (args.save_audio or args.save_video):
+            recorder = open_recorder(args.audio_in, args.verbose)
+        elif args.save_video:
+            warn("no --audio-in given -- the video will be silent")
+
+        log, end_ms = stream(inst, args, recorder)
+
         if args.save_mid:
             write_smf(args.save_mid, log.frames, end_ms)
             warn(f"wrote {len(log.frames)} frames to {args.save_mid}")
         if args.save_gif:
             write_animation(args.save_gif, log.durations(end_ms), inst, args)
+        if args.save_audio:
+            n = recorder.write_wav(args.save_audio)
+            warn(f"wrote {n} samples ({recorder.seconds:.1f} s) to "
+                 f"{args.save_audio}")
+        if args.save_video:
+            # The video needs the audio as a FILE. If it was not asked for by
+            # name it still has to exist somewhere, so it goes to a scratch file
+            # that is removed again once ffmpeg has read it.
+            scratch = None
+            audio_path = args.save_audio
+            if recorder is not None and not audio_path:
+                handle = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                handle.close()
+                scratch = audio_path = handle.name
+                recorder.write_wav(scratch)
+            try:
+                write_video(args.save_video, log.frames, end_ms, inst, args,
+                            audio_path=audio_path)
+            finally:
+                if scratch:
+                    os.unlink(scratch)
         if args.save_syx:
             with open(args.save_syx, "wb") as fh:
                 fh.write(log.frames[-1][0])
@@ -1088,6 +1632,12 @@ def main():
             blob = open(args.from_file, "rb").read()
         except OSError as exc:
             die(str(exc))
+        if args.save_video and not blob.startswith(b"MThd"):
+            die(f"{args.from_file} is not a Standard MIDI File, so it carries "
+                f"no timing to build a video from.\n"
+                f"    A .syx and a raw dump are single frames; a GIF has already "
+                f"rounded its timing to hundredths of a second.\n"
+                f"    Record with --save-mid and render from that.")
         if blob.startswith(b"MThd"):
             try:
                 frames, end_ms = read_smf(blob)
@@ -1099,6 +1649,10 @@ def main():
             if args.save_gif:
                 write_animation(args.save_gif, durations_from(frames, end_ms),
                                 inst, args)
+            if args.save_video:
+                write_video(args.save_video, frames, end_ms, inst, args,
+                            audio_path=args.from_audio)
+            if args.save_gif or args.save_video:
                 return 0
             width, height, pixels = parse_or_die(frames[0][0], inst)
         elif blob[:1] == bytes([SYSEX_START]):
