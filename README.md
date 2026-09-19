@@ -97,11 +97,14 @@ Output goes to stdout, so it pipes and tees like anything else:
 $ screendump -x --blocks | tee shot.txt
 ```
 
-To keep the frame itself rather than the picture of it, save and re-open:
+That keeps one fixed rendering, as characters. To keep the **data** instead,
+save the frame and re-open it — the pixels are still there, so you can render
+them differently afterwards without going back to the instrument:
 
 ```
 $ screendump -x --save-syx shot.syx
 $ screendump --from-file shot.syx --blocks
+$ screendump --from-file shot.syx --ascii --invert
 ```
 
 ## Live view and recording
