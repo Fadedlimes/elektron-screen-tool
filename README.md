@@ -255,9 +255,14 @@ silence and sound that runs long is trimmed.
 messages with nowhere to put it. A Standard MIDI File gives every event a delta,
 so the recording keeps its real pacing and stays readable by other MIDI tools.
 
-⚠️ GIF stores delays in centiseconds, so very fast animation is approximate and
-some viewers clamp delays below about 2 cs. With deduplication this rarely
-shows.
+⚠️ GIF stores delays in **centiseconds**, so most frame rates cannot be written
+exactly: 30 fps is 33.3 ms, or 3.33 cs. Rounding each frame on its own would
+make every one of them lose the same third of a centisecond, and a ten-second
+animation would play back in nine. `screendump` carries the remainder from frame
+to frame instead, so the delays alternate 3 and 4 cs and the total stays right.
+
+`--framerate 25` is the one rate that needs no correction at all — 40 ms is
+exactly 4 cs. Some viewers also clamp delays below about 2 cs.
 
 ## Set it once per session
 
