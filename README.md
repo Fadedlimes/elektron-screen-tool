@@ -151,6 +151,16 @@ and re-cut it without touching the instrument again.
 A GIF shows what the instrument is doing. For what it *sounds* like you need
 video, which means recording the audio at the same time.
 
+This part needs two things the screen does not — recording audio needs
+
+```
+pip install sounddevice
+```
+
+and writing the video needs **ffmpeg** on your `PATH` (`brew install ffmpeg`,
+`apt install ffmpeg`, `winget install ffmpeg`). Either one is named by the tool
+if it is missing, so you can also just try it and see.
+
 Find the audio input the same way as the MIDI ports:
 
 ```
