@@ -6,5 +6,8 @@ AGENTS.md
 # Local mount of the private shared-memory repo. Never staged, never shipped.
 /.shared_memory
 
+*.mid
+*.gif
+
 .DS_Store
 __pycache__/
