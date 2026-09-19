@@ -155,6 +155,12 @@ $ screendump --from-file cap.mid --save-gif out.gif
 A `.mid` keeps every frame and its timing, so you can come back to a recording
 and re-cut it without touching the instrument again.
 
+GIFs and videos are both enlarged four times by default — a 128 × 64 screen
+becomes 512 × 256, since the raw size is nearly invisible on a modern display.
+`--upscale N` changes it. Enlarging is nearest-neighbour on purpose: a 1-bit
+screen through a smoothing filter turns to mush. It costs little in a GIF, where
+4× is about four and a half times the bytes rather than sixteen.
+
 ⚠️ Some GIF viewers clamp very short delays, so a fast animation can play back
 slower than it was captured.
 
@@ -211,13 +217,9 @@ Or do it in one go, and skip the intermediate files:
 $ screendump -x --framerate 30 --audio-in dt --save-video out.mp4
 ```
 
-`--video-scale` sets how much each pixel is enlarged (default 4, so a 128 × 64
-screen becomes 512 × 256). Scaling is nearest-neighbour on purpose: a 1-bit
-screen through a smoothing filter turns to mush.
-
-Encoding is the slow part of a long recording — two minutes at the default scale
-is around half a gigabyte of raw frames handed to ffmpeg. `--video-scale 2`
-quarters that when you want a quick look rather than something to keep.
+Encoding is the slow part of a long recording — two minutes at the default size
+is around half a gigabyte of raw frames handed to ffmpeg. `--upscale 2` quarters
+that when you want a quick look rather than something to keep.
 
 ⚠️ **The first recording will ask for microphone permission** on macOS — that is
 the OS gate on *any* audio input, including an instrument. If you refuse it, the
@@ -299,7 +301,7 @@ An option always beats the environment. Setting variables differs by shell:
 | `--save-gif PATH` | also save an animated GIF |
 | `--save-audio PATH` | also record the instrument's audio to a stereo WAV |
 | `--save-video PATH` | write an mp4 of picture and sound together |
-| `--video-scale N` | enlarge each pixel to N × N in the video (default 4) |
+| `--upscale N` | enlarge each pixel to N × N in a GIF or video (default 4) |
 | `--from-file PATH` | render a saved `.syx`, `.mid` or raw dump instead |
 | `--from-audio PATH` | the `.wav` to pair with `--from-file` for a video |
 | `--bench N` | measure the frame rate over N captures |

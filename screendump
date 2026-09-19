@@ -629,6 +629,23 @@ def gif_delays(delays_ms):
     return out
 
 
+def scale_grid(grid, n):
+    """Each pixel as a solid n x n block.
+
+    Nearest-neighbour, like the video path and for the same reason: a 1-bit
+    screen through any smoothing filter turns to mush. A 128 x 64 screen is
+    barely visible at its own size on a modern display, so both file outputs
+    enlarge by default.
+    """
+    if n <= 1:
+        return grid
+    out = []
+    for row in grid:
+        wide = [px for px in row for _ in range(n)]
+        out.extend([wide] * n)
+    return out
+
+
 def write_gif(path, grids, delays_ms, invert=False, loop=0):
     h = len(grids[0])
     w = len(grids[0][0])
@@ -662,13 +679,15 @@ def write_gif(path, grids, delays_ms, invert=False, loop=0):
 
 def write_animation(path, timed, instrument, args):
     """timed = [(sysex bytes, duration_ms)] -> an animated GIF."""
+    scale = max(1, args.upscale)
     grids, delays = [], []
     for raw, ms in timed:
         w, h, px = parse_or_die(raw, instrument)
-        grids.append(unpack(px, w, h, args.flip))
+        grids.append(scale_grid(unpack(px, w, h, args.flip), scale))
         delays.append(ms)
     write_gif(path, grids, delays, invert=args.invert)
-    warn(f"wrote {len(grids)} frames ({sum(delays) / 1000:.1f} s) to {path}")
+    warn(f"wrote {len(grids)} frames ({sum(delays) / 1000:.1f} s), "
+         f"{w * scale}x{h * scale}, to {path}")
 
 
 # ------------------------------------------------------------------- AUDIO
@@ -990,7 +1009,7 @@ def write_video(path, frames, end_ms, instrument, args, audio_path=None):
     """frames = [(sysex bytes, start_ms)] -> an mp4, with sound if given."""
     exe = _ffmpeg()
     fps = max(1, min(60, args.framerate or 30))
-    scale = max(1, args.video_scale)
+    scale = max(1, args.upscale)
     order = cfr_indices([start for _, start in frames], end_ms, fps)
 
     w, h, _ = parse_or_die(frames[0][0], instrument)
@@ -1458,6 +1477,21 @@ def self_test(args, inst):
         print(f"gif delays:     {carried:.0f} ms for 10 s at 30 fps "
               f"(rounding each alone: {naive:.0f} ms)")
 
+    # The two file outputs scale by different routes -- the GIF builds a bigger
+    # grid, the video emits bytes straight out -- so they are checked against
+    # each other rather than only against themselves.
+    big = scale_grid(grid, 3)
+    if len(big) != inst.height * 3 or len(big[0]) != inst.width * 3:
+        print(f"FAIL: scale_grid gave {len(big[0])}x{len(big)}"); ok = False
+    elif any(big[y][x] != grid[y // 3][x // 3]
+             for y in (0, 1, 5, 17, 40) for x in (0, 2, 9, 31, 100)):
+        print("FAIL: scale_grid moved a pixel"); ok = False
+    elif frame_bytes(grid, 3) != frame_bytes(big, 1):
+        print("FAIL: GIF and video scaling disagree"); ok = False
+    else:
+        print(f"upscale:        {inst.width * 3}x{inst.height * 3} at 3x, "
+              f"both paths agree")
+
     scale = 3
     blob = frame_bytes(grid, scale)
     want = inst.width * inst.height * scale * scale
@@ -1586,9 +1620,10 @@ def main():
     ap.add_argument("--from-audio", metavar="PATH",
                     help="the .wav to pair with --from-file when writing a "
                          "video -- a .mid holds the picture, never the sound")
-    ap.add_argument("--video-scale", type=int, default=4, metavar="N",
-                    help="enlarge each pixel to an N x N square in the video "
-                         "(default 4, so 128x64 becomes 512x256)")
+    ap.add_argument("--upscale", type=int, default=4, metavar="N",
+                    help="enlarge each pixel to an N x N square in a GIF or "
+                         "video (default 4, so 128x64 becomes 512x256); does "
+                         "not affect the terminal")
     ap.add_argument("--timeout", type=float, default=2.0,
                     help="reply timeout in seconds (default 2)")
     ap.add_argument("-v", "--verbose", action="store_true")
