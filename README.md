@@ -48,6 +48,34 @@ Output goes to stdout, so it pipes and tees like anything else:
 $ screendump -x --blocks | tee shot.txt
 ```
 
+## Live view and recording
+
+```
+$ screendump -x --framerate 30
+```
+
+Streams the screen in the terminal, redrawing in place, until **Ctrl+C**. The
+rate is capped at 30 — the instrument's own refresh, so asking for more only
+returns duplicate frames. `-H` / `--hide` records without drawing anything.
+
+```
+$ screendump -x --framerate 30 --save-mid cap.mid     # watch and record
+$ screendump -x --framerate 30 --save-gif out.gif     # straight to GIF
+$ screendump --from-file cap.mid --save-gif out.gif   # or build it afterwards
+```
+
+Only frames that actually **changed** are kept, each with the length of time it
+was on screen — so a still screen costs one frame, not thirty a second.
+
+That timing is why recordings are **Standard MIDI Files** rather than `.syx`: a
+`.syx` is a bare run of `F0 … F7` messages with nowhere to put time, while an SMF
+gives every event a delta. The capture keeps its real pacing and stays readable
+by other MIDI tools.
+
+⚠️ GIF stores delays in **centiseconds**, so fast animation is approximate and
+some viewers clamp delays below about 2 cs. Deduplication means this rarely
+shows — most frames last far longer than that.
+
 ## Set it once per session
 
 ```
@@ -77,8 +105,13 @@ An option always beats the environment. Setting variables differs by shell:
 | `--blocks` | half-block rendering, no row gaps |
 | `--ascii` | full resolution, one character per pixel |
 | `--invert`, `--flip` | swap lit/unlit, flip vertically |
+| `--framerate N` | with `-x`, stream until Ctrl+C (capped at 30) |
+| `-H`, `--hide` | while streaming, don't draw to the terminal |
 | `--save-syx PATH` | also save the frame |
-| `--from-file PATH` | render a saved frame instead of capturing |
+| `--save-raw PATH` | also save just the pixel bytes |
+| `--save-mid PATH` | also save the recording, with timing, as a MIDI file |
+| `--save-gif PATH` | also save an animated GIF |
+| `--from-file PATH` | render a saved `.syx`, `.mid` or raw dump instead |
 | `--bench N` | measure the frame rate over N captures |
 | `--self-test` | check the tool without an instrument |
 | `--timeout` | reply timeout in seconds, default 2 |

@@ -6,6 +6,15 @@
     screendump -x --blocks | tee shot.txt
     screendump --from-file frame.syx --instrument dt --blocks
 
+    screendump -x --framerate 30                       live view, Ctrl+C stops
+    screendump -x --framerate 30 --save-mid cap.mid    record while watching
+    screendump --from-file cap.mid --save-gif out.gif  turn it into a GIF
+
+Recording keeps only the frames that actually changed, with the time each one
+was on screen. That timing needs a Standard MIDI File: a .syx is a bare run of
+messages with nowhere to put time. Pass --save-gif while streaming to get the
+GIF directly, or from a .mid afterwards.
+
 Ports are whatever --list-midi reports, given either as an index or as part
 of a port name. Indices are quickest; a name fragment survives replugging other
 gear, which can renumber the list.
@@ -365,6 +374,245 @@ def render(grid, args):
     return render_braille(grid, invert=args.invert)
 
 
+# ------------------------------------------------------------- timed capture
+#
+# A .syx file is a bare concatenation of F0..F7 messages -- it has nowhere to put
+# time. A Standard MIDI File does: every event carries a variable-length delta.
+# With division = 1000 ticks per quarter and tempo = 1e6 microseconds per
+# quarter, one tick is exactly one millisecond, so a capture keeps its real
+# timing and stays a file other MIDI tools can read.
+#
+# The final delta is written before the end-of-track meta event, which is how the
+# LAST frame's duration survives -- otherwise it would have no successor to
+# measure against.
+
+SMF_DIVISION = 1000        # ticks per quarter note
+SMF_TEMPO = 1000000        # microseconds per quarter note => 1 tick == 1 ms
+
+
+def _varlen(n):
+    """MIDI variable-length quantity."""
+    out = bytearray([n & 0x7F])
+    n >>= 7
+    while n:
+        out.append((n & 0x7F) | 0x80)
+        n >>= 7
+    return bytes(reversed(out))
+
+
+def _read_varlen(buf, i):
+    n = 0
+    while i < len(buf):
+        b = buf[i]
+        i += 1
+        n = (n << 7) | (b & 0x7F)
+        if not b & 0x80:
+            break
+    return n, i
+
+
+def write_smf(path, frames, end_ms):
+    """frames = [(sysex bytes, start_ms)], end_ms = when capture stopped."""
+    track = bytearray(b"\x00\xff\x51\x03" + SMF_TEMPO.to_bytes(3, "big"))
+    prev = frames[0][1] if frames else 0
+    for raw, start in frames:
+        track += _varlen(max(0, int(start - prev)))
+        prev = start
+        track += b"\xf0" + _varlen(len(raw) - 1) + raw[1:]
+    track += _varlen(max(0, int(end_ms - prev))) + b"\xff\x2f\x00"
+
+    head = (b"MThd" + (6).to_bytes(4, "big") + (0).to_bytes(2, "big")
+            + (1).to_bytes(2, "big") + SMF_DIVISION.to_bytes(2, "big"))
+    with open(path, "wb") as fh:
+        fh.write(head + b"MTrk" + len(track).to_bytes(4, "big") + bytes(track))
+
+
+def read_smf(blob):
+    """Return ([(sysex bytes, start_ms)], end_ms)."""
+    if not blob.startswith(b"MThd"):
+        raise ValueError("not a Standard MIDI File")
+    pos = 8 + int.from_bytes(blob[4:8], "big")
+    frames, end = [], 0
+    while pos + 8 <= len(blob):
+        cid = blob[pos:pos + 4]
+        clen = int.from_bytes(blob[pos + 4:pos + 8], "big")
+        body = blob[pos + 8:pos + 8 + clen]
+        pos += 8 + clen
+        if cid != b"MTrk":
+            continue
+        i, now, status = 0, 0, None
+        while i < len(body):
+            delta, i = _read_varlen(body, i)
+            now += delta
+            end = now
+            if i >= len(body):
+                break
+            b0 = body[i]
+            if b0 == 0xFF:                              # meta
+                i += 2
+                ln, i = _read_varlen(body, i)
+                i += ln
+            elif b0 in (0xF0, 0xF7):                    # sysex
+                i += 1
+                ln, i = _read_varlen(body, i)
+                payload = body[i:i + ln]
+                i += ln
+                if b0 == 0xF0:
+                    frames.append((bytes([0xF0]) + payload, now))
+            else:                                       # channel message
+                if b0 & 0x80:
+                    status = b0
+                    i += 1
+                elif status is None:
+                    break                               # malformed
+                i += 1 if (status & 0xF0) in (0xC0, 0xD0) else 2
+    return frames, end
+
+
+class FrameLog:
+    """Frames that actually differ, each with the moment it appeared.
+
+    A frame's DURATION is the time until the next one starts, not the time since
+    the last -- same numbers shifted by one, and it means the final frame has to
+    be given its length when the capture stops.
+
+    ⚠️ Comparison is on the decoded PIXELS, never on the raw SysEx. Every reply
+    carries a message id the instrument takes from an incrementing counter, so
+    two byte-identical screens arrive as two different SysEx messages. Comparing
+    the raw bytes keeps every single frame and the deduplication silently does
+    nothing -- which is exactly what it did until a real capture showed 549
+    polled and 549 kept on a screen that was not moving.
+    """
+
+    def __init__(self):
+        self.frames = []          # [(sysex bytes, start_ms)]
+        self.polled = 0
+        self._last = None         # the previous frame's pixels
+
+    def add(self, raw, pixels, now_ms):
+        self.polled += 1
+        if self._last == pixels:
+            return False
+        self._last = pixels
+        self.frames.append((raw, now_ms))
+        return True
+
+    def durations(self, end_ms):
+        return durations_from(self.frames, end_ms)
+
+
+def durations_from(frames, end_ms):
+    """[(raw, start_ms)] -> [(raw, duration_ms)]."""
+    out = []
+    for i, (raw, start) in enumerate(frames):
+        nxt = frames[i + 1][1] if i + 1 < len(frames) else end_ms
+        out.append((raw, max(0, nxt - start)))
+    return out
+
+
+# ------------------------------------------------------------------------ GIF
+#
+# 1-bit GIF89a. Delay is stored in CENTIseconds, so 30 fps is not exactly
+# representable and very short delays are clamped by some viewers. Deduplication
+# makes both mostly moot: a screen that is not animating produces long frames.
+
+class _BitWriter:
+    def __init__(self):
+        self.out = bytearray()
+        self.acc = 0
+        self.n = 0
+
+    def write(self, code, size):
+        self.acc |= code << self.n
+        self.n += size
+        while self.n >= 8:
+            self.out.append(self.acc & 0xFF)
+            self.acc >>= 8
+            self.n -= 8
+
+    def flush(self):
+        if self.n:
+            self.out.append(self.acc & 0xFF)
+            self.acc = self.n = 0
+        return bytes(self.out)
+
+
+def lzw_encode(pixels, min_code_size=2):
+    """GIF-flavoured LZW. Codes are packed LSB-first."""
+    clear = 1 << min_code_size
+    eoi = clear + 1
+    bw = _BitWriter()
+    size = min_code_size + 1
+    table = {bytes([i]): i for i in range(clear)}
+    nxt = eoi + 1
+    bw.write(clear, size)
+    cur = b""
+    for px in pixels:
+        nc = cur + bytes([px])
+        if nc in table:
+            cur = nc
+            continue
+        bw.write(table[cur], size)
+        if nxt < 4096:
+            table[nc] = nxt
+            nxt += 1
+            if nxt > (1 << size) and size < 12:
+                size += 1
+        else:
+            bw.write(clear, size)
+            table = {bytes([i]): i for i in range(clear)}
+            nxt = eoi + 1
+            size = min_code_size + 1
+        cur = bytes([px])
+    if cur:
+        bw.write(table[cur], size)
+    bw.write(eoi, size)
+    return bw.flush()
+
+
+def write_gif(path, grids, delays_ms, invert=False, loop=0):
+    h = len(grids[0])
+    w = len(grids[0][0])
+    dark, light = (0, 0, 0), (255, 255, 255)
+    palette = (light, dark) if invert else (dark, light)
+
+    out = bytearray(b"GIF89a")
+    out += w.to_bytes(2, "little") + h.to_bytes(2, "little")
+    out += bytes([0x80, 0, 0])                      # global table, 2 entries
+    for rgb in palette:
+        out += bytes(rgb)
+    out += (b"\x21\xff\x0bNETSCAPE2.0\x03\x01"
+            + loop.to_bytes(2, "little") + b"\x00")
+
+    for grid, ms in zip(grids, delays_ms):
+        cs = max(2, min(0xFFFF, int(round(ms / 10.0))))
+        out += b"\x21\xf9\x04\x04" + cs.to_bytes(2, "little") + b"\x00\x00"
+        out += (b"\x2c" + (0).to_bytes(2, "little") + (0).to_bytes(2, "little")
+                + w.to_bytes(2, "little") + h.to_bytes(2, "little") + b"\x00")
+        pixels = bytes(1 if v else 0 for row in grid for v in row)
+        data = lzw_encode(pixels, 2)
+        out += bytes([2])
+        for i in range(0, len(data), 255):
+            chunk = data[i:i + 255]
+            out += bytes([len(chunk)]) + chunk
+        out += b"\x00"
+
+    out += b"\x3b"
+    with open(path, "wb") as fh:
+        fh.write(bytes(out))
+
+
+def write_animation(path, timed, instrument, args):
+    """timed = [(sysex bytes, duration_ms)] -> an animated GIF."""
+    grids, delays = [], []
+    for raw, ms in timed:
+        w, h, px = parse_or_die(raw, instrument)
+        grids.append(unpack(px, w, h, args.flip))
+        delays.append(ms)
+    write_gif(path, grids, delays, invert=args.invert)
+    warn(f"wrote {len(grids)} frames ({sum(delays) / 1000:.1f} s) to {path}")
+
+
 # -------------------------------------------------------------------- MIDI
 
 def _rtmidi():
@@ -436,57 +684,151 @@ def resolve_port(spec, names, what):
     return matches[0]
 
 
-def capture(instrument, out_spec, in_spec, timeout_s, repeat=1, verbose=False):
-    """Send N screenshot requests, returning the replies and round-trip times."""
+def open_ports(out_spec, in_spec, verbose=False):
     rtmidi = _rtmidi()
     midi_in = rtmidi.MidiIn()
     midi_out = rtmidi.MidiOut()
-    ins, outs = midi_in.get_ports(), midi_out.get_ports()
-
-    in_idx = resolve_port(in_spec, ins, "midi-in")
-    out_idx = resolve_port(out_spec, outs, "midi-out")
+    in_idx = resolve_port(in_spec, midi_in.get_ports(), "midi-in")
+    out_idx = resolve_port(out_spec, midi_out.get_ports(), "midi-out")
     if verbose:
-        warn(f"out -> {outs[out_idx]}")
-        warn(f"in  <- {ins[in_idx]}")
-
+        warn(f"out -> {midi_out.get_ports()[out_idx]}")
+        warn(f"in  <- {midi_in.get_ports()[in_idx]}")
     midi_in.open_port(in_idx)
     midi_in.ignore_types(sysex=False, timing=True, active_sense=True)
     midi_out.open_port(out_idx)
+    return midi_in, midi_out
 
+
+def request_frame(midi_in, midi_out, request, timeout_s):
+    """One request, one complete reply. Returns (raw, seconds) or (None, None)."""
+    while midi_in.get_message() is not None:     # drop anything already queued
+        pass
+    buf = bytearray()
+    start = time.monotonic()
+    midi_out.send_message(request)
+    deadline = start + timeout_s
+    while time.monotonic() < deadline:
+        msg = midi_in.get_message()
+        if msg is None:
+            time.sleep(0.0005)
+            continue
+        data = msg[0]
+        if data and data[0] == SYSEX_START:
+            buf = bytearray()
+        buf.extend(data)
+        if buf and buf[-1] == SYSEX_END:
+            return bytes(buf), time.monotonic() - start
+    return None, None
+
+
+TIMEOUT_HINT = ("    Check the ports with --list-midi, and that the instrument "
+                "is not busy with Overbridge.")
+
+
+def capture(instrument, out_spec, in_spec, timeout_s, repeat=1, verbose=False):
+    """Send N screenshot requests, returning the replies and round-trip times."""
+    midi_in, midi_out = open_ports(out_spec, in_spec, verbose)
     request = list(build_request(instrument))
     replies, timings = [], []
     try:
         for _ in range(repeat):
-            # drain anything already queued so a stale frame cannot be returned
-            while midi_in.get_message() is not None:
-                pass
-            buf = bytearray()
-            start = time.monotonic()
-            midi_out.send_message(request)
-            deadline = start + timeout_s
-            while time.monotonic() < deadline:
-                msg = midi_in.get_message()
-                if msg is None:
-                    time.sleep(0.0005)
-                    continue
-                data = msg[0]
-                if data and data[0] == SYSEX_START:
-                    buf = bytearray()
-                buf.extend(data)
-                if buf and buf[-1] == SYSEX_END:
-                    break
-            if buf and buf[-1] == SYSEX_END:
-                timings.append(time.monotonic() - start)
-                replies.append(bytes(buf))
+            raw, seconds = request_frame(midi_in, midi_out, request, timeout_s)
+            if raw is not None:
+                replies.append(raw)
+                timings.append(seconds)
             elif repeat == 1:
                 die(f"timed out after {timeout_s:.1f} s with no complete SysEx "
-                    f"reply.\n    Check the ports with --list-midi, and that "
-                    f"the instrument is not busy with Overbridge.")
+                    f"reply.\n" + TIMEOUT_HINT)
     finally:
         midi_in.close_port()
         midi_out.close_port()
         del midi_in, midi_out
     return replies, timings
+
+
+def _enable_ansi_on_windows():
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        kernel.SetConsoleMode(kernel.GetStdHandle(-11), 7)
+    except Exception:
+        pass
+
+
+def stream(instrument, args):
+    """Live view: poll, redraw in place, and log the frames that differ.
+
+    Ctrl+C stops. The last frame is given its duration at that point, so a
+    recording made here is complete rather than truncated.
+    """
+    _enable_ansi_on_windows()
+    fps = max(1, min(30, args.framerate))
+    interval = 1.0 / fps
+    midi_in, midi_out = open_ports(args.midi_out, args.midi_in, args.verbose)
+    request = list(build_request(instrument))
+
+    log = FrameLog()
+    drawing = not args.hide and sys.stdout.isatty()
+    if not args.hide and not drawing:
+        warn("stdout is not a terminal -- streaming without drawing")
+    picture = ""
+    misses = 0
+    t0 = time.monotonic()
+
+    # The ALTERNATE SCREEN is what makes this behave like a proper full-screen
+    # tool: the live view never enters the scrollback, and on exit the terminal
+    # is exactly as it was -- the commands that started it still visible.
+    # Clearing the normal screen instead overwrites whatever was there, and it
+    # cannot be scrolled back to.
+    if drawing:
+        sys.stdout.write("\033[?1049h\033[?25l")
+    try:
+        while True:
+            tick = time.monotonic()
+            raw, _ = request_frame(midi_in, midi_out, request, args.timeout)
+            if raw is None:
+                misses += 1
+            else:
+                # decode every poll -- cheap, and the pixels are what decides
+                # whether this frame is new (the SysEx header never repeats)
+                w, h, px = parse_or_die(raw, instrument)
+                now_ms = (time.monotonic() - t0) * 1000.0
+                if log.add(raw, px, now_ms) and drawing:
+                    picture = render(unpack(px, w, h, args.flip), args)
+            if drawing:
+                elapsed = max(1e-6, time.monotonic() - t0)
+                status = (f"{log.polled / elapsed:4.1f} fps  "
+                          f"{log.polled} polled  {len(log.frames)} kept  "
+                          f"{elapsed:5.1f}s"
+                          + (f"  {misses} timed out" if misses else "")
+                          + "   Ctrl+C to stop")
+                body = "\n".join(l + "\033[K" for l in picture.split("\n"))
+                sys.stdout.write("\033[H" + body + "\033[K\n\n" + status + "\033[K")
+                sys.stdout.flush()
+            rest = interval - (time.monotonic() - tick)
+            if rest > 0:
+                time.sleep(rest)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if drawing:
+            sys.stdout.write("\033[?25h\033[?1049l")
+            sys.stdout.flush()
+        midi_in.close_port()
+        midi_out.close_port()
+        del midi_in, midi_out
+
+    end_ms = (time.monotonic() - t0) * 1000.0
+    if not log.frames:
+        die("no frames captured.\n" + TIMEOUT_HINT)
+    # leave the last frame behind, so the session ends with something to look at
+    # rather than vanishing along with the alternate screen
+    if drawing and picture:
+        print(picture)
+    warn(f"{log.polled} polled, {len(log.frames)} kept, {end_ms / 1000:.1f} s")
+    return log, end_ms
 
 
 def parse_or_die(raw, instrument):
@@ -653,11 +995,25 @@ def main():
                     help="flip vertically (escape hatch; not needed on verified "
                          "instruments)")
 
+    ap.add_argument("--framerate", type=int, metavar="N",
+                    help="with -x, stream continuously at up to N fps (capped at "
+                         "30, the instrument's own refresh) until Ctrl+C")
+    ap.add_argument("-H", "--hide", action="store_true",
+                    help="with --framerate, do not draw to the terminal; useful "
+                         "when you only want the recording")
+
     ap.add_argument("--save-syx", metavar="PATH",
                     help="also write the raw SysEx reply (self-describing; "
                          "prefer this for anything you keep)")
     ap.add_argument("--save-raw", metavar="PATH",
                     help="also write the raw pixel bytes")
+    ap.add_argument("--save-mid", metavar="PATH",
+                    help="also write a Standard MIDI File of the capture -- the "
+                         "only one of these formats that records TIMING, which a "
+                         "bare .syx cannot")
+    ap.add_argument("--save-gif", metavar="PATH",
+                    help="also write an animated GIF; works while streaming, or "
+                         "from a .mid with --from-file")
     ap.add_argument("--timeout", type=float, default=2.0,
                     help="reply timeout in seconds (default 2)")
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -703,6 +1059,22 @@ def main():
     if args.bench:
         return bench(inst, args)
 
+    if args.external and args.framerate:
+        log, end_ms = stream(inst, args)
+        if args.save_mid:
+            write_smf(args.save_mid, log.frames, end_ms)
+            warn(f"wrote {len(log.frames)} frames to {args.save_mid}")
+        if args.save_gif:
+            write_animation(args.save_gif, log.durations(end_ms), inst, args)
+        if args.save_syx:
+            with open(args.save_syx, "wb") as fh:
+                fh.write(log.frames[-1][0])
+        if args.save_raw:
+            _, _, px = parse_or_die(log.frames[-1][0], inst)
+            with open(args.save_raw, "wb") as fh:
+                fh.write(px)
+        return 0
+
     if args.external:
         replies, _ = capture(inst, args.midi_out, args.midi_in,
                              args.timeout, verbose=args.verbose)
@@ -716,7 +1088,20 @@ def main():
             blob = open(args.from_file, "rb").read()
         except OSError as exc:
             die(str(exc))
-        if blob[:1] == bytes([SYSEX_START]):
+        if blob.startswith(b"MThd"):
+            try:
+                frames, end_ms = read_smf(blob)
+            except ValueError as exc:
+                die(str(exc))
+            if not frames:
+                die(f"{args.from_file}: no SysEx frames in that MIDI file")
+            warn(f"{len(frames)} frames over {end_ms / 1000:.1f} s")
+            if args.save_gif:
+                write_animation(args.save_gif, durations_from(frames, end_ms),
+                                inst, args)
+                return 0
+            width, height, pixels = parse_or_die(frames[0][0], inst)
+        elif blob[:1] == bytes([SYSEX_START]):
             width, height, pixels = parse_or_die(blob, inst)
         else:
             expected = inst.width * ((inst.height + 31) // 32) * 4
