@@ -114,7 +114,12 @@ Streams the screen, redrawing in place, until **Ctrl+C**. Your terminal is left
 exactly as it was — the live view never enters the scrollback.
 
 The rate is capped at 30, the instrument's own refresh, so asking for more just
-returns the same frame twice. Over USB 30 is realistic; over DIN expect about 3.
+returns the same frame twice. Over DIN expect about 3.
+
+Over USB, `--bench` measures a clean 30 fps, while the live view settles nearer
+26–27 once it is also drawing and recording. That costs you nothing in accuracy:
+every frame is stamped with the moment it arrived, so a recording keeps its real
+pacing whether the loop hit 30 or 26.
 
 ### Record while you watch
 
@@ -141,7 +146,7 @@ $ screendump --from-file cap.mid --save-gif out.gif
 A `.mid` keeps every frame and its timing, so you can come back to a recording
 and re-cut it without touching the instrument again.
 
-## Sound, and video
+## Sound and video
 
 A GIF shows what the instrument is doing. For what it *sounds* like you need
 video, which means recording the audio at the same time.
@@ -187,6 +192,10 @@ $ screendump -x --framerate 30 --audio-in dt --save-video out.mp4
 `--video-scale` sets how much each pixel is enlarged (default 4, so a 128 × 64
 screen becomes 512 × 256). Scaling is nearest-neighbour on purpose: a 1-bit
 screen through a smoothing filter turns to mush.
+
+Encoding is the slow part of a long recording — two minutes at the default scale
+is around half a gigabyte of raw frames handed to ffmpeg. `--video-scale 2`
+quarters that when you want a quick look rather than something to keep.
 
 ⚠️ **The first recording will ask for microphone permission** on macOS — that is
 the OS gate on *any* audio input, including an instrument. If you refuse it, the
@@ -269,7 +278,7 @@ An option always beats the environment. Setting variables differs by shell:
 | `--blocks` | half-block rendering, no row gaps |
 | `--ascii` | full resolution, one character per pixel |
 | `--invert`, `--flip` | swap lit/unlit, flip vertically |
-| `--framerate N` | with `-x`, stream until Ctrl+C (capped at 30) |
+| `--framerate N` | with `-x`, stream until Ctrl+C (capped at 30); also the frame rate of a video |
 | `-H`, `--hide` | while streaming, don't draw to the terminal |
 | `--save-syx PATH` | also save the frame |
 | `--save-raw PATH` | also save just the pixel bytes |
