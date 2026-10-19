@@ -1,8 +1,8 @@
 # screendump / Elektron-Screen-Tool
 
 See your Elektron instrument's screen in the terminal — or in a window.
-
 <img width="512" height="256" alt="screendump-20261018-223646" src="https://github.com/user-attachments/assets/80953731-1989-4879-9edf-70e444fa57ab" />
+
 
 
 It uses the instrument's own screenshot command over MIDI. **Nothing on the
