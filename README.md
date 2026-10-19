@@ -53,24 +53,56 @@ $ screendump -x --blocks
 A real 128 × 64 screen, unretouched — the Digitakt's SRC page, with `LEV`,
 `STRT`, `LEN`, `LOOP` and `LEV` under their knobs.
 
+## Run it
+
+`screendump` is one Python file with no installer, so every `$ screendump` in
+this README is shorthand for *that file, invoked somehow*. Nothing puts a
+command on your `PATH` for you unless you ask it to. Two ways, pick either.
+
+**Link the file onto your `PATH`**, which is what makes the examples below copy
+and paste as written. `~/.local/bin` is usually on the `PATH`; check with
+`echo $PATH` if the command afterwards is not found:
+
+```
+mkdir -p ~/.local/bin
+ln -s "$PWD/screendump" ~/.local/bin/screendump
+screendump --list-midi
+```
+
+**Or call the file directly**, from the folder that holds it, and leave your
+`PATH` alone:
+
+```
+./screendump --list-midi
+python3 ./screendump --list-midi
+```
+
+Both work: the file is executable and starts with `#!/usr/bin/env python3`. You
+need Python 3, which Linux ships as `python3`.
+
+⚠️ **Snapshot and Record write into the folder you started from**, not next to
+the script. Start it somewhere you will find the files again.
+
 ## Install
 
 ```
-pip install python-rtmidi
+python3 -m pip install python-rtmidi
 ```
 
-`screendump` is a single file: put it on your `PATH` and make it executable, or
-simply run it from the repo.
+`python3 -m pip` and not bare `pip`, so the package lands in the interpreter
+that runs the script. A second Python on the `PATH` is the usual reason for
+"python-rtmidi is not installed" from a machine that has just installed it.
 
-That one package is all you need to see a screen. Two more things are needed
-only if you want sound and video, and each is named when it is missing, so
-nothing has to be installed up front:
+That one package is all you need to see a screen. The rest are needed only for
+sound, video, or the window, and each is named when it is missing, so nothing
+has to be installed up front:
 
 | for | install |
 |---|---|
-| the screen, recording, GIF | `pip install python-rtmidi` |
-| `--save-audio` | `pip install sounddevice` |
+| the screen, recording, GIF | `python3 -m pip install python-rtmidi` |
+| `--save-audio` | `python3 -m pip install sounddevice` |
 | `--save-video` | ffmpeg — `brew install ffmpeg`, `apt install ffmpeg`, `winget install ffmpeg` |
+| `--gui` | tkinter — `sudo apt install python3-tk` (Debian/Ubuntu), `sudo dnf install python3-tkinter` (Fedora); part of Python elsewhere. See [A window instead of the terminal](#a-window-instead-of-the-terminal) |
 
 ## Find your MIDI ports
 
@@ -90,13 +122,21 @@ $ screendump -x --midi-in 0 --midi-out 0 --instrument dt
 
 `-x` is the only mode that talks to hardware.
 
+Those `0`s are indices from `--list-midi`, and on a machine with other MIDI gear
+the instrument will not be number 0. Either read the number off that listing, or
+pass the instrument's own name instead — `--midi-in dtii --midi-out dtii` — and
+skip the lookup entirely.
+
 Ports can be given three ways: an index from `--list-midi`, an instrument short
 form (`--midi-in dt`), or any fragment of the port name (`--midi-in MOTU`, handy
 when the instrument is behind a MIDI interface). A fragment has to identify
 exactly one port — if two match, it stops and shows you both rather than
 choosing for you.
 
-`--instrument` currently only knows `dt` for Digitakt, but will be expanded as more devices are confirmed.
+`--instrument` takes only a machine a real screen has been captured from and
+read: `dt` for a Digitakt, `dtii` for a Digitakt II. The others are known by
+name and cannot be attempted — without an instrument id there is no request to
+send. See [Instruments](#instruments).
 
 Output goes to stdout, so it pipes and tees like anything else:
 
@@ -117,11 +157,19 @@ $ screendump --from-file shot.syx --ascii --invert
 ## Live view and recording
 
 ```
-$ screendump -x --framerate 30
+$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii --framerate 30
 ```
 
 Streams the screen, redrawing in place, until **Ctrl+C**. Your terminal is left
 exactly as it was — the live view never enters the scrollback.
+
+Every command from here on needs the same three things the capture above did:
+`-x`, `--instrument`, and the two ports. See [Set it once per
+session](#set-it-once-per-session) to put the ports in the environment and stop
+repeating them.
+
+For a window instead of the terminal — the way to get this screen into OBS —
+see [A window instead of the terminal](#a-window-instead-of-the-terminal).
 
 The rate is capped at 30, the instrument's own refresh, so asking for more just
 returns the same frame twice. Over DIN expect about 3.
