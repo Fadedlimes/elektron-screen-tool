@@ -285,6 +285,67 @@ def build_response(instrument, pixels, msg_id=0x2A, reply_to=1):
     return instrument.header + encode7(body) + bytes([SYSEX_END])
 
 
+def screen_frame_header(raw):
+    """What a screenshot reply says about itself, with no instrument assumed.
+
+    The reply carries its own id bytes, version, width, height and pixel length.
+    That is what makes a machine that has never been captured from identifiable
+    without already knowing which machine it is -- the frame describes the
+    sender. Raises ValueError with the reason when the message is not a
+    screenshot reply at all.
+    """
+    if len(raw) < 8 or raw[0] != SYSEX_START or raw[-1] != SYSEX_END:
+        raise ValueError("not one complete SysEx message (F0 ... F7)")
+    if not raw.startswith(bytes((SYSEX_START,) + ELEKTRON)):
+        raise ValueError(f"not an Elektron message: {raw[:6].hex(' ')}")
+    body = decode7(raw[6:-1])
+    if len(body) < 5:
+        raise ValueError(f"body too short: {len(body)} B")
+    if body[4] != CMD_SCREENSHOT_RESPONSE:
+        raise ValueError(f"not a screenshot reply: command {body[4]:#04x}")
+    payload = body[5:]
+    if len(payload) < 9:
+        raise ValueError(f"screenshot payload truncated: {len(payload)} B")
+    return {"ident": raw[4:6],
+            "msg_id": int.from_bytes(body[0:2], "big"),
+            "reply_to": int.from_bytes(body[2:4], "big"),
+            "ver": payload[0],
+            "width": int.from_bytes(payload[1:3], "big"),
+            "height": int.from_bytes(payload[3:5], "big"),
+            "declared": int.from_bytes(payload[5:9], "big"),
+            "pixels": payload[9:]}
+
+
+def unique_stamp(prefix, exts):
+    """A timestamp whose implied filenames are free, since one run writes two.
+
+    Second resolution is all time.strftime offers, and tracing twice in a row
+    is exactly what a person does while trying candidate ids -- so the second
+    run must not quietly overwrite the first run's evidence.
+    """
+    base = time.strftime("%Y%m%d-%H%M%S")
+    stamp, n = base, 2
+    while any(os.path.exists(f"{prefix}-{stamp}{e}") for e in exts):
+        stamp, n = f"{base}-{n}", n + 1
+    return stamp
+
+
+def parse_ident(text):
+    """'10 00', '0x10 0x00', '10,00' or '1000' -> the two id bytes."""
+    cleaned = text.replace("0x", " ").replace("0X", " ").replace(",", " ")
+    parts = cleaned.split()
+    if len(parts) == 1 and len(parts[0]) == 4:
+        parts = [parts[0][:2], parts[0][2:]]
+    try:
+        values = [int(p, 16) for p in parts]
+    except ValueError:
+        values = []
+    if len(values) != 2 or not all(0 <= v <= 0xFF for v in values):
+        die(f"--probe-id wants two hexadecimal bytes, for example 10 00\n"
+            f"    got {text!r}")
+    return bytes(values)
+
+
 def parse_response(sysex, instrument):
     """Return (width, height, pixels) from one complete SysEx message."""
     header = instrument.header
@@ -1351,6 +1412,94 @@ def parse_or_die(raw, instrument):
         die(str(exc))
 
 
+TRACE_ISSUES = "https://github.com/Fadedlimes/elektron-screen-tool/issues/new"
+
+
+def trace(args):
+    """Ask an instrument for one screenshot using bytes the caller supplies.
+
+    This is how a machine becomes supportable. Everything else here refuses to
+    speak to an instrument whose id is unknown, which is right, but on its own
+    it leaves no way to *find* one -- so the last step of adding a machine was
+    always a human with the source and a guess. This is that guess, made
+    explicit and repeatable.
+
+    One request, the instrument's own stock screenshot command, read-only, and
+    nothing written to the device. The reply is reported exactly as it arrived,
+    silence included. Nothing here adds anything to the table: a person reads
+    the picture against the instrument first, and that is what earns it a row.
+    """
+    ident = parse_ident(args.probe_id)
+    midi_in, midi_out = open_ports(args.midi_out, args.midi_in, args.verbose)
+    request = list(bytes((SYSEX_START,) + ELEKTRON) + ident
+                   + encode7(bytes([0, 1, 0, 0, CMD_SCREENSHOT_REQUEST]))
+                   + bytes([SYSEX_END]))
+    warn(f"asking with id {ident.hex(' ')} -- one request")
+    raw, _ = request_frame(midi_in, midi_out, request, args.timeout)
+    for port in (midi_in, midi_out):
+        try:
+            port.close_port()
+        except Exception:
+            pass
+
+    stamp = unique_stamp("screendump-trace", (".txt", ".syx"))
+    report = [f"screendump trace, {time.strftime('%Y-%m-%d %H:%M:%S')}",
+              f"candidate id   {ident.hex(' ')}",
+              f"midi in        {args.midi_in}",
+              f"midi out       {args.midi_out}"]
+    syx_path = ""
+
+    if raw is None:
+        report += [f"result         no reply within {args.timeout:g} s", ""]
+        warn(f"no reply to a request with id {ident.hex(' ')}.")
+        warn("    Both answers are useful: the machine may not answer this "
+             "command at all,\n"
+             "    or those two bytes may not be its id. Try another pair, and "
+             "report what\n"
+             f"    you tried: {TRACE_ISSUES}")
+    else:
+        syx_path = os.path.abspath(f"screendump-trace-{stamp}.syx")
+        with open(syx_path, "wb") as fh:
+            fh.write(raw)
+        report += [f"result         reply, {len(raw)} B", ""]
+        try:
+            head = screen_frame_header(raw)
+        except ValueError as exc:
+            report += [f"could not read it as a screenshot reply: {exc}", "",
+                       "the raw message is in the .syx; that is still worth "
+                       "sending"]
+            warn(f"got {len(raw)} B back, but it is not a screenshot reply: "
+                 f"{exc}")
+        else:
+            w, h, declared = head["width"], head["height"], head["declared"]
+            have = len(head["pixels"])
+            report += [f"id on the wire {head['ident'].hex(' ')}",
+                       f"version        {head['ver']}",
+                       f"geometry       {w} x {h}",
+                       f"pixels         {declared} B declared, {have} B present",
+                       ""]
+            warn(f"reply: id {head['ident'].hex(' ')} on the wire, "
+                 f"{w} x {h}, {declared} B of pixels")
+            sane = 0 < w <= 512 and 0 < h <= 512 and have >= declared > 0
+            if not sane:
+                warn("    those numbers do not describe a screen -- send the "
+                     ".syx anyway")
+            else:
+                warn("\n" + render_blocks(unpack(head["pixels"], w, h)))
+                warn("\ndoes that match the instrument's screen? If it does, "
+                     "this machine\nworks and the two bytes above are its id.")
+        report += [f"frame          {syx_path}", ""]
+
+    report += ["Does the picture above match the screen on the instrument? "
+               "Say so when you send this.",
+               f"Attach this file and the .syx to {TRACE_ISSUES}"]
+    report_path = os.path.abspath(f"screendump-trace-{stamp}.txt")
+    with open(report_path, "w") as fh:
+        fh.write("\n".join(report) + "\n")
+    warn(f"wrote {os.path.basename(report_path)}")
+    return 0 if raw is not None else 1
+
+
 def bench(instrument, args):
     """Measure the achievable frame rate: round-trip time per capture."""
     started = time.monotonic()
@@ -1871,6 +2020,34 @@ def _tkinter():
     return tkinter, ttk, font
 
 
+def detect_instruments(names):
+    """[(instrument, port index)] for Elektron devices named in a port list.
+
+    The operating system names a port after the device, which is the only
+    signal available without talking to it -- so detection is free and says
+    nothing about whether a machine can be *asked* for a screen. That is a
+    separate question, answered by whether the instrument carries id bytes.
+
+    Longest name wins, so a "Digitakt II" port is not read as its older
+    sibling. The word "elektron" has to be in the name: a port is named by the
+    operating system and nobody controls its spelling, but every Elektron
+    device carries the vendor name, and nothing else does.
+    """
+    found, seen = [], set()
+    for i, name in enumerate(names):
+        low = name.lower()
+        if "elektron" not in low:
+            continue
+        hits = [x for x in INSTRUMENTS if x.name.lower() in low]
+        if not hits:
+            continue
+        best = max(hits, key=lambda x: len(x.name))
+        if best.short not in seen:
+            seen.add(best.short)
+            found.append((best, i))
+    return found
+
+
 def _midi_ports():
     """(input names, output names) as the system reports them right now."""
     rtmidi = _rtmidi()
@@ -1923,8 +2100,12 @@ class ScreenWindow:
         self._gif_job = None
         self._fit_job = None
         self._status_at = 0.0
+        self._rate, self._rate_at, self._rate_polled = 0.0, 0.0, 0
         self._message_until = 0.0
         self._messages = queue.SimpleQueue()
+        self._devices = [           # [(label, instrument, port or None)]
+            (f"{i.name} ({i.short})", i, None) for i in INSTRUMENTS]
+        self._ready = []            # detected devices that can actually be asked
 
         self.mono = font.nametofont("TkFixedFont").copy()
         self.mono.configure(size=9)
@@ -1942,7 +2123,16 @@ class ScreenWindow:
         if args.external:
             self._rescan(select=False)
             self._preselect()
-            self._connect()
+            if self._ready:
+                self._connect()
+            else:
+                # The one state that looks like a bug and is not. A sample
+                # transfer holds the port -- and the instrument answers nothing
+                # while it runs -- so the window opens with nothing to show and
+                # no reason given unless it is given here.
+                self._flash("no Elektron instrument found on a MIDI port — a "
+                            "sample transfer holds it; quit the transfer and "
+                            "press ⟳", 30.0)
 
     # ------------------------------------------------------------------ setup
 
@@ -1996,12 +2186,27 @@ class ScreenWindow:
                             font=self.mono)
 
         self.in_box = self.out_box = self.fps_box = None
+        self.device_box = self.trace_btn = None
 
         # The ports get a row of their own. On one row with everything else the
         # bar would be twice as wide as the screen, and the window would sit in
         # a desert of black on either side -- which is exactly what a video
         # capture of it does not want.
         if self.args.external:
+            # Which machine, before which port. The list is every instrument
+            # this tool knows by name, not only the connected ones: a box that
+            # is recognised but cannot be asked yet is still worth showing,
+            # because it is what Trace is for. Nothing here sends anything.
+            dev = tk.Frame(self.bar, bg=GUI_PANEL)
+            dev.pack(side="top", fill="x", padx=10, pady=(5, 0))
+            label(dev, "device").pack(side="left")
+            self.device_box = ttk.Combobox(dev, state="readonly", width=34)
+            self.device_box.pack(side="left", padx=(5, 8))
+            self.device_box.bind("<<ComboboxSelected>>", self._device_changed)
+            self.trace_btn = ttk.Button(dev, text="Trace\u2026", width=8,
+                                        command=self._trace)
+            self.trace_btn.pack(side="left")
+
             ports = tk.Frame(self.bar, bg=GUI_PANEL)
             ports.pack(side="top", fill="x", padx=10, pady=(5, 0))
             label(ports, "MIDI in").pack(side="left")
@@ -2080,9 +2285,24 @@ class ScreenWindow:
             self._flash("python-rtmidi is not installed — pip install "
                         "python-rtmidi")
             self.in_ports, self.out_ports = [], []
+            self._devices = [(f"{i.name} ({i.short})", i, None)
+                             for i in INSTRUMENTS]
             return
         self.in_box.configure(values=port_labels(self.in_ports))
         self.out_box.configure(values=port_labels(self.out_ports))
+        seen = {inst.short: port for inst, port in
+                detect_instruments(self.in_ports)}
+        self._devices = []
+        for inst in INSTRUMENTS:
+            port = seen.get(inst.short)
+            note = ("not detected" if port is None else
+                    "ready" if inst.implemented else "no request known")
+            self._devices.append((f"{inst.name} ({inst.short}) \u2014 {note}",
+                                  inst, port))
+        self._ready = [d for d in self._devices
+                       if d[2] is not None and d[1].implemented]
+        if self.device_box is not None:
+            self.device_box.configure(values=[d[0] for d in self._devices])
         if select:
             self._preselect()
 
@@ -2113,6 +2333,91 @@ class ScreenWindow:
                 idx = 0
             box.current(idx)
 
+        if self.device_box is not None:
+            for n, (_, inst, _) in enumerate(self._devices):
+                if inst.short == self.instrument.short:
+                    self.device_box.current(n)
+                    break
+
+    # ---------------------------------------------------------------- devices
+
+    def _device_changed(self, event=None):
+        """A machine was picked from the list."""
+        idx = self.device_box.current()
+        if idx < 0 or idx >= len(self._devices):
+            return
+        _, inst, port = self._devices[idx]
+        if port is not None:
+            self.in_box.current(port)
+            self.out_box.current(port)
+        if not inst.implemented:
+            if port is None:
+                self._flash(f"the {inst.name} is not on a MIDI port — connect "
+                            f"it, then press ⟳", 12.0)
+            else:
+                self._flash(f"the {inst.name} is connected, but no request is "
+                            f"known for it yet — Trace can find out", 12.0)
+            return
+        self._set_instrument(inst)
+
+    def _set_instrument(self, inst):
+        """Switch machines in place, rather than starting the window again."""
+        if inst is self.instrument:
+            return
+        was_live = self.live is not None
+        if was_live:
+            self._disconnect()
+        self.instrument = inst
+        self.grid = None            # the old picture belongs to the old machine
+        self._seq = -1
+        self._photo = None
+        self.canvas.itemconfigure(self._item, image="")
+        self.canvas.configure(width=inst.width * self.scale,
+                              height=inst.height * self.scale)
+        self.root.title(f"screendump — {inst.name}")
+        self._flash(f"showing the {inst.name}")
+        if was_live:
+            self._connect()
+
+    def _trace(self):
+        """One screenshot request with candidate bytes, for a machine with no id.
+
+        The same code the command line runs, so the file it leaves behind is
+        the same file: something to attach to an issue.
+        """
+        idx = self.device_box.current() if self.device_box is not None else -1
+        if idx < 0 or idx >= len(self._devices):
+            self._flash("pick a device first")
+            return
+        _, inst, port = self._devices[idx]
+        if port is None:
+            self._flash(f"the {inst.name} is not on a MIDI port — connect it, "
+                        f"then press ⟳")
+            return
+        spec = str(port)
+        self._flash(f"tracing the {inst.name} with id 10 00 — one request, and "
+                    f"nothing is written to the instrument", 30.0)
+
+        def work():
+            args = argparse.Namespace(probe_id="10 00", midi_in=spec,
+                                      midi_out=spec, timeout=self.args.timeout,
+                                      verbose=False)
+            try:
+                code = trace(args)
+            except BaseException as exc:
+                self._flash_threadsafe(f"trace failed: {exc}")
+                return
+            if code == 0:
+                self._flash_threadsafe("trace: a frame came back — see the "
+                                       "terminal, and check it against the "
+                                       "instrument's own screen")
+            else:
+                self._flash_threadsafe("trace: no reply — the report says which "
+                                       "bytes were tried")
+
+        threading.Thread(target=work, daemon=False,
+                         name="screendump-trace").start()
+
     def _connect(self):
         if self.in_box is None:
             return
@@ -2128,6 +2433,14 @@ class ScreenWindow:
         except SystemExit:
             self._flash("could not open those ports — see the terminal")
             return
+        except Exception as exc:
+            # rtmidi raises SystemError when something else already holds the
+            # port -- an easy thing to do, by opening the window twice. That is
+            # a sentence in the status line, not a traceback and a dead window.
+            self._flash(f"could not open those ports: {exc} — a sample "
+                        f"transfer holds them; quit it and press ⟳", 20.0)
+            return
+        self._rate, self._rate_at, self._rate_polled = 0.0, 0.0, 0
         self.live = LiveSource(self.instrument, midi_in, midi_out,
                                fps=self._fps(), timeout=self.args.timeout)
         self.live.start()
@@ -2239,8 +2552,14 @@ class ScreenWindow:
 
         if self.live is None and self.replay is None:
             self.chip.configure(text="IDLE", fg=GUI_DIM)
-            self.counters.configure(text="not connected" if (self.in_ports or
-                                     self.out_ports) else "no MIDI ports found")
+            if self._ready:
+                self.counters.configure(text="not connected")
+            elif self.in_ports or self.out_ports:
+                self.counters.configure(
+                    text="no Elektron instrument on any port — a transfer can "
+                         "hold it")
+            else:
+                self.counters.configure(text="no MIDI ports found")
             return
 
         if self.live is not None:
@@ -2257,7 +2576,18 @@ class ScreenWindow:
             self.chip.configure(text="NO REPLY" if stale else "LIVE",
                                 fg=GUI_REC if stale else GUI_ACCENT)
             elapsed = max(1e-6, now - self.live.started)
-            text = (f"{self.live.polled / elapsed:4.1f} fps   "
+            # The rate is measured over the last second, not since start. A
+            # single reply that misses costs the whole timeout -- two seconds
+            # of nothing -- and averaging that over the lifetime makes a window
+            # that is keeping up perfectly look permanently slow.
+            if self._rate_at == 0.0:
+                self._rate, self._rate_at = (self.live.polled / elapsed), now
+                self._rate_polled = self.live.polled
+            elif now - self._rate_at >= 1.0:
+                span = now - self._rate_at
+                self._rate = (self.live.polled - self._rate_polled) / span
+                self._rate_at, self._rate_polled = now, self.live.polled
+            text = (f"{self._rate:4.1f} fps   "
                     f"{self.live.polled} polled   {self.live.kept} kept   "
                     f"{elapsed:5.1f} s")
             if self.live.misses:
@@ -2490,11 +2820,19 @@ def main():
                       help="verify the codec and renderer, no instrument needed")
     mode.add_argument("--emit-sample", metavar="PATH",
                       help="write a synthetic response frame, for testing")
+    mode.add_argument("--trace", action="store_true",
+                      help="ask an instrument for ONE screenshot using id bytes "
+                           "you supply, and report what comes back -- the way an "
+                           "unknown machine gets identified (SENDS MIDI)")
     mode.add_argument("--bench", type=int, metavar="N",
                       help="benchmark the achievable FRAME RATE over N captures: "
                            "round-trip times, sustained fps, wire throughput "
                            "(SENDS MIDI)")
 
+    ap.add_argument("--probe-id", metavar="BB BB", default="10 00",
+                    help="with --trace, the two id bytes to try, in hexadecimal "
+                         "(default 10 00, which both the Digitakt and the "
+                         "Digitakt II answer)")
     ap.add_argument("--gui", action="store_true",
                     help="show the screen in a window instead of the terminal: "
                          "live with -x, or a replay with --from-file. Needs "
@@ -2564,7 +2902,7 @@ def main():
     args = ap.parse_args()
 
     if args.gui and (args.list_midi or args.list_audio or args.self_test
-                     or args.emit_sample or args.bench):
+                     or args.emit_sample or args.bench or args.trace):
         die("--gui is a mode of its own -- it cannot be combined with "
             "--list-midi, --list-audio, --self-test, --emit-sample or --bench.")
     if args.gui and (args.save_audio or args.save_video):
@@ -2595,6 +2933,36 @@ def main():
         die("--from-audio is only used when writing a video with --save-video.")
     if args.save_video and args.from_file and not args.from_audio:
         warn("no --from-audio given -- the video will be silent")
+
+    # --trace is the exception, by design: it exists for machines whose id is
+    # not known yet, so it cannot require the id it is trying to establish.
+    if args.trace:
+        return trace(args)
+
+    # The window can work out which machine to show from the port names, but
+    # only when there is nothing to work out: exactly one implemented Elektron
+    # device on a MIDI port. That is reading the device's own name, not a guess
+    # at which machine was meant, and saying so is better than being silent.
+    if args.gui and args.external and not args.instrument:
+        usable = [i for i, _ in detect_instruments(_midi_ports()[0])
+                  if i.implemented]
+        if len(usable) == 1:
+            args.instrument = usable[0].short
+            warn(f"detected the {usable[0].name} on a MIDI port — pass "
+                 f"--instrument to override")
+        elif not usable:
+            die("the window could not find an Elektron instrument on any MIDI "
+                "port.\n"
+                "    If a sample transfer is running it holds the port, so "
+                "quit the transfer\n"
+                "    and try again -- the instrument answers nothing while it "
+                "runs.\n"
+                "    screendump --list-midi\n"
+                "    Then pass --instrument, or set SCREENDUMP_INSTRUMENT.")
+        else:
+            die("the window found more than one Elektron instrument: "
+                + ", ".join(i.name for i in usable)
+                + ".\n    Pass --instrument to say which to show.")
 
     # Every other mode needs to know which instrument it is talking about.
     if not args.instrument:

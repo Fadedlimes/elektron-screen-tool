@@ -91,11 +91,16 @@ the wire, so the tool will not guess. Leave it out and it stops with *"no
 instrument selected"* — which is the usual reason a first run appears to do
 nothing at all.
 
-**The window** needs only that one, because it finds its own ports:
+**The window** finds its own ports, so it needs only the machine — and it can
+work that out for itself when exactly one Elektron device is plugged in, by
+reading the port name. Either of these opens the same window:
 
 ```
+screendump -x --gui
 screendump -x --instrument dtii --gui
 ```
+
+With two machines connected there is nothing to read: say which one.
 
 The terminal modes need the two ports as well, either named:
 
@@ -279,11 +284,18 @@ picked, press **Connect**.
 
 | | |
 |---|---|
+| **device** | every machine this tool knows by name, with what it found: `ready`, `no request known`, or `not detected`. Picking a ready one switches the window to it, ports and all |
+| **Trace…** | for a machine with no request known yet: sends one screenshot request and writes a report and the frame it got back, ready to attach to an issue |
 | status line | fps, frames polled, frames kept, and how long this has run. `NO REPLY` means the picture has stopped arriving, and what you see is the last frame |
 | **Snapshot** | writes a PNG of the current screen, at the size it is drawn |
 | **Record** | writes a `.mid` and a `.gif` into the current folder, named by the time it stopped |
 | resize | whole pixels only — the window opens at 4× and grows in integer steps, so the screen never blurs |
 | invert, flip, on top | swap light and dark, flip vertically, keep the window above other applications |
+
+⚠️ **A sample transfer holds the port.** While Transfer is running, the
+instrument answers no screenshot requests and the window has nothing to show —
+so it opens saying exactly that rather than looking broken. Quit the transfer
+and press **⟳**.
 
 Keys: `s` snapshot, `r` record, `i` invert, `f` flip, `F11` fullscreen, `Esc`
 leave fullscreen, `q` quit. In a replay, `space` pauses.
@@ -446,6 +458,8 @@ An option always beats the environment. Setting variables differs by shell:
 | `--upscale N` | enlarge each pixel to N × N in a GIF or video, and the window's opening size (default 4) |
 | `--from-file PATH` | render a saved `.syx`, `.mid` or raw dump instead |
 | `--from-audio PATH` | the `.wav` to pair with `--from-file` for a video |
+| `--trace` | ask an instrument for one screenshot using id bytes you supply, and report what comes back (SENDS MIDI) |
+| `--probe-id "BB BB"` | with `--trace`, the two hex bytes to try (default `10 00`) |
 | `--bench N` | measure the frame rate over N captures |
 | `--self-test` | check the tool without an instrument |
 | `--timeout` | reply timeout in seconds, default 2 |
@@ -511,3 +525,41 @@ forms never do, which is the easier habit.
 
 An instrument moves to the implemented list once a screen has been captured from
 it and read. Adding one is a few lines — see the notes at the top of the script.
+
+## A machine that is not in the table
+
+Two bytes decide whether a machine can be asked for its screen, and Elektron
+does not publish them. They differ per model, they are not the bytes in a
+firmware file, and a wrong pair does not fail loudly — it can return a picture
+that looks plausible and is wrong. So nothing is added on the strength of a
+number quoted somewhere: it is added when a real screen has been captured from
+that machine and read.
+
+`--trace` is how that capture gets made by someone who owns the machine:
+
+```
+$ screendump --trace --midi-in 1 --midi-out 1
+$ screendump --trace --midi-in 1 --midi-out 1 --probe-id "0c 00"
+```
+
+One request, the instrument's own screenshot command, nothing written to it. It
+prints what comes back — including silence, which is information too — and
+leaves a report and the raw frame:
+
+```
+screendump-trace-20261018-231807.txt
+screendump-trace-20261018-231807.syx
+```
+
+The reply describes itself: it carries its own id bytes, geometry and pixel
+length, so a machine nobody has catalogued can still be identified from what it
+says about itself. If the picture printed in the terminal matches the screen on
+the instrument, those two bytes are its id.
+
+Send both files and that yes-or-no through the [new instrument
+template](https://github.com/Fadedlimes/elektron-screen-tool/issues/new/choose).
+The port name is asked for as well, because it is what the window's device
+dropdown uses to notice the machine is plugged in.
+
+The same thing is the **Trace…** button in the window, which runs against
+whichever machine is selected and leaves the same two files.
