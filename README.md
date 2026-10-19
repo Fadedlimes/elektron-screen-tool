@@ -141,7 +141,7 @@ screendump -x --instrument dtii --midi-in dtii --midi-out dtii \
 
 ## Graphical Window Mode (`--gui`)
 
-For OBS capture or clean desktop viewing, launch the Tkinter graphical window:
+For OBS capture or clean desktop viewing, launch the graphical window:
 
 ```bash
 screendump -x --instrument dtii --gui
