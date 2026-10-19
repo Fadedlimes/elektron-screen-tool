@@ -1,11 +1,18 @@
 # screendump
 
-See your Elektron instrument's screen in the terminal.
+See your Elektron instrument's screen in the terminal — or in a window.
 
 It uses the instrument's own screenshot command over MIDI. **Nothing on the
 instrument is modified** — no firmware change, no flashing.
 
-Works on macOS, and awaits testing on Linux and Windows.
+Works on macOS and Linux. Windows awaits a tester.
+
+> **Credit:** the capture tool is [Jakob Bak's
+> screendump](https://github.com/jakobbak/screendump), MIT licensed — see
+> `LICENSE`, which stays with the copyright intact. This fork adds a window for
+> recording the screen in OBS, and support for the Digitakt II. The wire format,
+> the renderings, the recording and the video export are his work.
+
 
 ```
 $ screendump -x --blocks
@@ -164,6 +171,57 @@ screen through a smoothing filter turns to mush. It costs little in a GIF, where
 ⚠️ Some GIF viewers clamp very short delays, so a fast animation can play back
 slower than it was captured.
 
+## A window instead of the terminal
+
+A terminal live view is for you. A window is for a video recorder: OBS can
+capture it, and the screen is drawn at whatever size the window is.
+
+```
+$ screendump -x --gui
+```
+
+The window needs **tkinter**, which is part of Python but is packaged
+separately on Linux:
+
+```
+sudo apt install python3-tk        # Debian/Ubuntu
+sudo dnf install python3-tkinter   # Fedora
+sudo pacman -S tk                  # Arch
+```
+
+Nothing else is needed, and every other mode works without it.
+
+It connects as soon as the ports resolve — the port carrying the instrument's
+own name is picked for you, and both can be changed in the bar. If nothing is
+picked, press **Connect**.
+
+| | |
+|---|---|
+| status line | fps, frames polled, frames kept, and how long this has run. `NO REPLY` means the picture has stopped arriving, and what you see is the last frame |
+| **Snapshot** | writes a PNG of the current screen, at the size it is drawn |
+| **Record** | writes a `.mid` and a `.gif` into the current folder, named by the time it stopped |
+| resize | whole pixels only — the window opens at 4× and grows in integer steps, so the screen never blurs |
+| invert, flip, on top | swap light and dark, flip vertically, keep the window above other applications |
+
+Keys: `s` snapshot, `r` record, `i` invert, `f` flip, `F11` fullscreen, `Esc`
+leave fullscreen, `q` quit. In a replay, `space` pauses.
+
+### A window with no instrument
+
+Point it at a recording and it plays back at the speed it was captured — which
+is also the way to try the window on a machine with no MIDI ports at all.
+
+```
+$ screendump --from-file cap.mid --gui
+```
+
+⚠️ The window records **picture only**. Record writes a `.mid` and a `.gif`;
+for sound, use the terminal: `screendump -x --framerate 30 --audio-in dt
+--save-mid clip.mid --save-audio take.wav`. The window can then replay the
+`.mid` while the pair is turned into a video in the usual way.
+
+Tested on Linux with Tk 9.0. macOS and Windows have not been tried yet.
+
 ## Sound and video
 
 A GIF shows what the instrument is doing. For what it *sounds* like you need
@@ -293,6 +351,7 @@ An option always beats the environment. Setting variables differs by shell:
 | `--blocks` | half-block rendering, no row gaps |
 | `--ascii` | full resolution, one character per pixel |
 | `--invert`, `--flip` | swap lit/unlit, flip vertically |
+| `--gui` | show the screen in a window instead of the terminal: live with `-x`, or a replay with `--from-file` |
 | `--framerate N` | with `-x`, stream until Ctrl+C (capped at 30); also the frame rate of a video |
 | `-H`, `--hide` | while streaming, don't draw to the terminal |
 | `--save-syx PATH` | also save the frame |
@@ -301,7 +360,7 @@ An option always beats the environment. Setting variables differs by shell:
 | `--save-gif PATH` | also save an animated GIF |
 | `--save-audio PATH` | also record the instrument's audio to a stereo WAV |
 | `--save-video PATH` | write an mp4 of picture and sound together |
-| `--upscale N` | enlarge each pixel to N × N in a GIF or video (default 4) |
+| `--upscale N` | enlarge each pixel to N × N in a GIF or video, and the window's opening size (default 4) |
 | `--from-file PATH` | render a saved `.syx`, `.mid` or raw dump instead |
 | `--from-audio PATH` | the `.wav` to pair with `--from-file` for a video |
 | `--bench N` | measure the frame rate over N captures |
@@ -340,12 +399,15 @@ decides what goes on the wire, so a typo should be an error rather than a guess.
 | | | |
 |---|---|---|
 | `DT` | `dt` | Digitakt |
+| `DTII` | `dtii` | `"Digitakt II"` |
+
+The Digitakt II answers the Digitakt request and reports the same 128 × 64
+screen, so one capture path serves both and either name works.
 
 **Known, not implemented**
 
 | | | |
 |---|---|---|
-| `DTII` | `dtii` | `"Digitakt II"` |
 | `DN` | `dn` | `Digitone` |
 | `DNII` | `dnii` | `"Digitone II"` |
 | `ST` | `st` | `Syntakt` |

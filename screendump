@@ -16,6 +16,9 @@
     screendump --from-file cap.mid --from-audio cap.wav \
                --save-video out.mp4                     mux them into a video
 
+    screendump -x --gui                                live view in a window
+    screendump --from-file cap.mid --gui               replay it in the window
+
 Recording keeps only the frames that actually changed, with the time each one
 was on screen. That timing needs a Standard MIDI File: a .syx is a bare run of
 messages with nowhere to put time. Pass --save-gif while streaming to get the
@@ -110,13 +113,20 @@ building from source:
 # ---------------------------------------------------------------------------
 
 import argparse
+import base64
+import bisect
 import os
+import queue
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import traceback
 import wave
+import zlib
 
 SYSEX_START = 0xF0
 SYSEX_END = 0xF7
@@ -160,8 +170,13 @@ class Instrument:
 # M:S) and are matched case-insensitively, so dt / DT / Dt all work, as does the
 # full name.
 INSTRUMENTS = [
+    # The II answers the mk1's id bytes and reports the same 128x64 geometry, so
+    # one request serves both. A screen was captured from a Digitakt II and read
+    # -- page name, tempo, and every parameter label -- which is what earns it a
+    # place here. Two entries rather than one alias because --instrument is how
+    # the machine is named everywhere else, including the window's title.
     Instrument("Digitakt",      "DT",   ident=(0x10, 0x00), width=128, height=64),
-    Instrument("Digitakt II",   "DTII"),
+    Instrument("Digitakt II",   "DTII", ident=(0x10, 0x00), width=128, height=64),
     Instrument("Digitone",      "DN"),
     Instrument("Digitone II",   "DNII"),
     Instrument("Syntakt",       "ST"),
@@ -1503,6 +1518,29 @@ def self_test(args, inst):
         print(f"video frame:    {inst.width * scale}x{inst.height * scale}, "
               f"{len(blob)} B grayscale")
 
+    # The window draws through a PNG rather than through Tk's own pixel calls:
+    # Tk 9 dropped PPM and GIF from the photo image, so a PNG is the one format
+    # both 8.6 and 9.0 read. Checking it here keeps the encoder honest on a
+    # machine with no display -- which is the only way to test the window's
+    # drawing offline.
+    png = png_bytes(grid, 3, invert=False)
+    gw, gh = inst.width * 3, inst.height * 3
+    if png[:8] != b"\x89PNG\r\n\x1a\n":
+        print("FAIL: the window's PNG has no signature"); ok = False
+    elif (int.from_bytes(png[16:20], "big"),
+          int.from_bytes(png[20:24], "big")) != (gw, gh):
+        print("FAIL: the window's PNG is the wrong size"); ok = False
+    elif (png_pixel(png, 0, 0) != GUI_ON
+          or png_pixel(png, gw - 1, 0) != GUI_ON):
+        print("FAIL: the window's PNG lost a lit edge pixel"); ok = False
+    elif png_pixel(png, gw - 1, gh - 1) != GUI_OFF:
+        print("FAIL: the window's PNG lit an unlit pixel"); ok = False
+    elif png_pixel(png_bytes(grid, 1, invert=True), 0, 0) != GUI_OFF:
+        print("FAIL: the window's PNG ignored invert"); ok = False
+    else:
+        print(f"window png:     {gw}x{gh} at 3x, {len(png)} B, "
+              f"corners and invert agree")
+
     # The WAV writer is stdlib, but the header fields are ours to get wrong.
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     tmp.close()
@@ -1528,6 +1566,898 @@ def self_test(args, inst):
     print()
     print("SELF-TEST", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
+
+
+# ------------------------------------------------------------------------ GUI
+#
+# A window, for the one thing a terminal is bad at: putting the instrument's
+# screen where a video recorder can see it.
+#
+# tkinter ships with Python, so none of this adds a dependency -- but on Linux it
+# is packaged separately, and that is reported by name when it is missing, the
+# same way sounddevice and ffmpeg are.
+#
+# Two sources feed one drawing function:
+#
+#   -x           a thread of its own polls the instrument. The window never
+#                touches the MIDI port, because request_frame() blocks for up to
+#                --timeout and doing that on the Tk thread freezes the window.
+#                The newest grid is left in a slot for the window to collect. A
+#                slow redraw therefore loses nothing: the RECORDING is filled in
+#                by that same thread, not by the drawing.
+#   --from-file  a .mid replayed against the clock, or one .syx / raw frame held
+#                still. That is also how the window can be tried with no
+#                instrument attached.
+#
+# The colours are the instrument's own -- light on dark, no inversion in the
+# chain -- and nothing is smoothed: a 1-bit screen through any filter turns to
+# mush, exactly as it would in a GIF or a video.
+
+GUI_BG     = "#0b0d0d"
+GUI_PANEL  = "#121616"
+GUI_LINE   = "#242c2c"
+GUI_FG     = "#ccd6d4"
+GUI_DIM    = "#6d7b79"
+GUI_ACCENT = "#7fe0c3"
+GUI_REC    = "#ff6060"
+GUI_ON     = (238, 245, 241)
+GUI_OFF    = (9, 11, 11)
+
+# Rows repeat constantly on these screens -- a blank line, a line of text -- so
+# the scaled RGB for a row is built once and reused. At 30 fps that is the
+# difference between a redraw costing a few milliseconds and a few tens.
+_PNG_ROWS = {}
+
+
+def png_chunk(tag, data):
+    return (struct.pack(">I", len(data)) + tag + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+
+def png_bytes(grid, scale=1, invert=False):
+    """A pixel grid as a 1-bit indexed PNG, each pixel a solid N x N square.
+
+    Nearest-neighbour, for the same reason the GIF and video paths are. PNG
+    rather than a hand-rolled bitmap because it is the one format BOTH Tk 8.6 and
+    Tk 9 read: Tk 9 dropped PPM and GIF from the photo image, so the obvious
+    "write a PPM and hand it over" no longer works on a current Linux.
+
+    One bit per pixel, with a two-entry palette, rather than 8-bit RGB. The
+    picture is 1-bit to begin with, and at a fullscreen 15x the difference is
+    the whole frame budget: a redraw decodes in 22 ms instead of 46, and the
+    file is 1.4 kB instead of 5.5 MB of pixels handed to Tk every frame.
+    """
+    h = len(grid)
+    w = len(grid[0]) if h else 0
+    nbits = w * scale
+    nbytes = (nbits + 7) // 8
+    pad = nbytes * 8 - nbits
+    mask = (1 << scale) - 1
+    body = bytearray()
+    for row in grid:
+        key = (bytes(row), scale)      # invert is the palette's job, not the
+        line = _PNG_ROWS.get(key)      # bits', so flipping it reuses every row
+        if line is None:
+            bits = 0
+            for px in row:
+                bits = (bits << scale) | (mask if px else 0)
+            line = (bits << pad).to_bytes(nbytes, "big")
+            if len(_PNG_ROWS) >= 4096:
+                _PNG_ROWS.clear()
+            _PNG_ROWS[key] = line
+        for _ in range(scale):
+            body += b"\x00" + line
+    return (b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR", struct.pack(">IIBBBBB", w * scale, h * scale,
+                                             1, 3, 0, 0, 0))
+            + png_chunk(b"PLTE", (bytes(GUI_ON) + bytes(GUI_OFF)) if invert
+                        else (bytes(GUI_OFF) + bytes(GUI_ON)))
+            + png_chunk(b"IDAT", zlib.compress(bytes(body), 6))
+            + png_chunk(b"IEND", b""))
+
+
+def png_pixel(png, x, y):
+    """One RGB pixel out of the PNG this file writes (indexed, 1 bit, filter 0).
+
+    Only for the self test: it keeps the encoder honest on a machine with no
+    display, which is the only way to test the window's drawing offline.
+    """
+    pos, w, depth, ctype, plte, idat = 8, 0, 0, 0, b"", b""
+    while pos < len(png):
+        n = int.from_bytes(png[pos:pos + 4], "big")
+        tag, data = png[pos + 4:pos + 8], png[pos + 8:pos + 8 + n]
+        pos += 12 + n
+        if tag == b"IHDR":
+            w = int.from_bytes(data[:4], "big")
+            depth, ctype = data[8], data[9]
+        elif tag == b"PLTE":
+            plte = data
+        elif tag == b"IDAT":
+            idat += data
+    if depth != 1 or ctype != 3:
+        raise ValueError(f"expected a 1-bit indexed PNG, got depth {depth} "
+                         f"type {ctype}")
+    raw = zlib.decompress(idat)
+    o = y * ((w + 7) // 8 + 1) + 1 + x // 8
+    bit = (raw[o] >> (7 - x % 8)) & 1
+    return tuple(plte[bit * 3:bit * 3 + 3])
+
+
+class LiveSource:
+    """Polls the instrument on a thread of its own.
+
+    The window only ever reads take(): the newest grid, and a counter that
+    changes when there is a new one. Everything that must not be lost -- the
+    recording -- is appended to a FrameLog here instead, so a slow redraw cannot
+    cost a frame.
+    """
+
+    def __init__(self, instrument, midi_in, midi_out, fps=30, timeout=2.0):
+        self.instrument = instrument
+        self.fps = max(1, min(30, int(fps)))
+        self.timeout = timeout
+        self.started = time.monotonic()
+        self.polled = 0
+        self.kept = 0
+        self.misses = 0
+        self.last_ok = None
+        self.error = None
+        self._midi_in = midi_in
+        self._midi_out = midi_out
+        self._grid = None
+        self._seq = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._log = None
+        self._rec_t0 = None
+        self._recording = False
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="screendump-midi")
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=self.timeout + 0.5)
+
+    def take(self):
+        with self._lock:
+            return self._grid, self._seq
+
+    def begin_recording(self):
+        with self._lock:
+            self._log = FrameLog()
+            self._rec_t0 = time.monotonic()
+            self._recording = True
+
+    def end_recording(self):
+        """[(sysex, start_ms)], end_ms, polls -- the same pair stream() returns."""
+        with self._lock:
+            self._recording = False
+            log, t0 = self._log, self._rec_t0
+            self._log = None
+        if log is None or t0 is None:
+            return [], 0.0, 0
+        return list(log.frames), (time.monotonic() - t0) * 1000.0, log.polled
+
+    def _run(self):
+        request = list(build_request(self.instrument))
+        last = None
+        try:
+            while not self._stop.is_set():
+                tick = time.monotonic()
+                raw, _ = request_frame(self._midi_in, self._midi_out, request,
+                                       self.timeout)
+                now = time.monotonic()
+                if raw is None:
+                    self.misses += 1
+                else:
+                    try:
+                        w, h, px = parse_response(raw, self.instrument)
+                    except ValueError as exc:
+                        self.error = str(exc)
+                        return
+                    self.polled += 1
+                    self.last_ok = now
+                    if px != last:      # compare PIXELS, never the SysEx -- the
+                        last = px      # message id changes even when the
+                        self.kept += 1  # screen does not
+                        with self._lock:
+                            self._grid = unpack(px, w, h)
+                            self._seq += 1
+                            if self._recording and self._log is not None:
+                                self._log.add(raw, px,
+                                              (now - self._rec_t0) * 1000.0)
+                rest = 1.0 / self.fps - (time.monotonic() - tick)
+                if rest > 0:
+                    self._stop.wait(rest)
+        finally:
+            for port in (self._midi_in, self._midi_out):
+                try:
+                    port.close_port()
+                except Exception:
+                    pass
+
+
+class ReplaySource:
+    """A recording played back against the clock.
+
+    Two uses: looking at a capture without the instrument, and trying this
+    window on a machine that has none. Frames are decoded on demand -- a long
+    capture is thousands of frames, and only the one on screen is needed.
+    """
+
+    def __init__(self, path, instrument):
+        self.instrument = instrument
+        self.frames = []             # [(start_ms, sysex)]
+        self.end_ms = 0.0
+        self.paused = False
+        self.paused_at = 0.0
+        self.t0 = time.monotonic()
+        self._at = -1
+        self._grid = None
+        try:
+            blob = open(path, "rb").read()
+        except OSError as exc:
+            die(str(exc))
+        if blob.startswith(b"MThd"):
+            try:
+                frames, self.end_ms = read_smf(blob)
+            except ValueError as exc:
+                die(str(exc))
+            if not frames:
+                die(f"{path}: no SysEx frames in that MIDI file")
+            self.frames = [(ms, raw) for raw, ms in frames]
+        elif blob[:1] == bytes([SYSEX_START]):
+            self.frames = [(0.0, blob)]
+        else:
+            expected = instrument.width * ((instrument.height + 31) // 32) * 4
+            if len(blob) != expected:
+                die(f"{path}: not a SysEx frame, and not {expected} raw bytes "
+                    f"for a {instrument.name} ({len(blob)} B).\n"
+                    f"    A raw dump carries no header, so it is only readable "
+                    f"with the instrument it came from.")
+            self.frames = [(0.0, build_response(instrument, blob))]
+        self.starts = [ms for ms, _ in self.frames]
+
+    def at(self, now):
+        """The grid for this instant, and the position in seconds."""
+        # milliseconds throughout: that is what the .mid stores, and mixing the
+        # two units here silently pins the replay to its first frame
+        if self.end_ms <= 0:
+            t = 0.0
+        elif self.paused:
+            t = self.paused_at
+        else:
+            t = ((now - self.t0) * 1000.0) % self.end_ms
+        i = max(0, bisect.bisect_right(self.starts, t) - 1)
+        i = min(i, len(self.frames) - 1)
+        if i != self._at:
+            _, raw = self.frames[i]
+            try:
+                w, h, px = parse_response(raw, self.instrument)
+            except ValueError as exc:
+                die(str(exc))
+            self._grid = unpack(px, w, h)
+            self._at = i
+        return self._grid, t
+
+    def toggle_pause(self, now):
+        if self.end_ms <= 0:
+            return
+        if self.paused:
+            self.t0 = now - self.paused_at / 1000.0
+            self.paused = False
+        else:
+            self.paused_at = ((now - self.t0) * 1000.0) % self.end_ms
+            self.paused = True
+
+
+def _tkinter():
+    """tkinter, or a sentence saying how to get it."""
+    try:
+        import tkinter
+        from tkinter import font, ttk
+    except ImportError:
+        die("the window needs tkinter, which ships with Python but is packaged "
+            "separately on Linux:\n"
+            "    Debian/Ubuntu   sudo apt install python3-tk\n"
+            "    Fedora          sudo dnf install python3-tkinter\n"
+            "    Arch            sudo pacman -S tk\n"
+            "Everything else -- terminal streaming, recording, GIF, video -- "
+            "works without it.")
+    return tkinter, ttk, font
+
+
+def _midi_ports():
+    """(input names, output names) as the system reports them right now."""
+    rtmidi = _rtmidi()
+    midi_in, midi_out = rtmidi.MidiIn(), rtmidi.MidiOut()
+    return midi_in.get_ports(), midi_out.get_ports()
+
+
+def port_labels(names):
+    """Short labels for a port list: the index, then the client name.
+
+    ALSA reports a port as "Client:Port 128:0" and usually repeats the client
+    name inside the port name, which is far too long for a picker -- the closed
+    box would show "0: Elektron Digi". The index is kept because it is what
+    --midi-in and --midi-out take, so a choice here can be typed anywhere.
+    Where two ports share a client, the port half is added to tell them apart.
+    """
+    clients = [n.split(":")[0].strip() or n for n in names]
+    out = []
+    for i, (name, client) in enumerate(zip(names, clients)):
+        if clients.count(client) > 1 and ":" in name:
+            tail = name.split(":", 1)[1].strip()[:16]
+            out.append(f"{i}: {client} — {tail}" if tail else f"{i}: {client}")
+        else:
+            out.append(f"{i}: {client}")
+    return out
+
+
+class ScreenWindow:
+    """The window: a canvas for the screen, a bar for everything else."""
+
+    def __init__(self, root, tk, ttk, font, instrument, args, replay=None):
+        self.root = root
+        self.tk = tk
+        self.instrument = instrument
+        self.args = args
+        self.replay = replay
+        self.live = None
+        self.in_ports, self.out_ports = [], []
+        self.grid = None            # the frame as decoded, never flipped
+        self.scale = max(1, args.upscale or 4)
+        self.invert = bool(args.invert)
+        self.flip = bool(args.flip)
+        self.recording = False
+        self.rec_started = 0.0
+        self._closing = False
+        self._seq = -1
+        self._replay_grid = None
+        self._photo = None
+        self._after = None
+        self._gif_job = None
+        self._fit_job = None
+        self._status_at = 0.0
+        self._message_until = 0.0
+        self._messages = queue.SimpleQueue()
+
+        self.mono = font.nametofont("TkFixedFont").copy()
+        self.mono.configure(size=9)
+        self.ui = font.nametofont("TkDefaultFont").copy()
+        self.ui.configure(size=10)
+
+        root.title(f"screendump — {instrument.name}")
+        root.configure(bg=GUI_BG)
+        root.protocol("WM_DELETE_WINDOW", self.quit)
+        root.minsize(360, 240)
+
+        self._style(ttk)
+        self._build(tk, ttk)
+        self._bind(tk)
+        if args.external:
+            self._rescan(select=False)
+            self._preselect()
+            self._connect()
+
+    # ------------------------------------------------------------------ setup
+
+    def _style(self, ttk):
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")     # the one theme whose colours obey
+        except self.tk.TclError:
+            pass
+        style.configure(".", background=GUI_PANEL, foreground=GUI_FG,
+                        fieldbackground=GUI_BG, bordercolor=GUI_LINE,
+                        lightcolor=GUI_LINE, darkcolor=GUI_LINE,
+                        troughcolor=GUI_BG, font=self.ui)
+        style.configure("TButton", padding=(10, 4), relief="flat",
+                        background=GUI_LINE, foreground=GUI_FG)
+        style.map("TButton",
+                  background=[("active", "#2e3838"), ("pressed", "#3a4646")],
+                  foreground=[("disabled", GUI_DIM)])
+        style.configure("TCheckbutton", background=GUI_PANEL,
+                        foreground=GUI_DIM)
+        style.map("TCheckbutton", foreground=[("selected", GUI_FG)])
+        style.configure("TCombobox", padding=(4, 2), arrowcolor=GUI_FG)
+        style.map("TCombobox", fieldbackground=[("readonly", GUI_BG)],
+                  foreground=[("readonly", GUI_FG)])
+        self.root.option_add("*TCombobox*Listbox.background", GUI_BG)
+        self.root.option_add("*TCombobox*Listbox.foreground", GUI_FG)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", GUI_LINE)
+
+    def _build(self, tk, ttk):
+        w = self.instrument.width * self.scale
+        h = self.instrument.height * self.scale
+
+        self.bar = tk.Frame(self.root, bg=GUI_PANEL)
+        self.bar.pack(side="bottom", fill="x")
+
+        # status: what the source is doing, and how fast
+        status = tk.Frame(self.bar, bg=GUI_PANEL)
+        status.pack(side="top", fill="x", padx=10, pady=(7, 0))
+        self.chip = tk.Label(status, text="IDLE", bg=GUI_PANEL, fg=GUI_DIM,
+                             font=self.mono)
+        self.chip.pack(side="left")
+        self.counters = tk.Label(status, text="not connected", bg=GUI_PANEL,
+                                 fg=GUI_DIM, font=self.mono)
+        self.counters.pack(side="left", padx=(12, 0))
+        self.rec_label = tk.Label(status, text="", bg=GUI_PANEL, fg=GUI_REC,
+                                  font=self.mono)
+        self.rec_label.pack(side="right")
+
+        def label(parent, text):
+            return tk.Label(parent, text=text, bg=GUI_PANEL, fg=GUI_DIM,
+                            font=self.mono)
+
+        self.in_box = self.out_box = self.fps_box = None
+
+        # The ports get a row of their own. On one row with everything else the
+        # bar would be twice as wide as the screen, and the window would sit in
+        # a desert of black on either side -- which is exactly what a video
+        # capture of it does not want.
+        if self.args.external:
+            ports = tk.Frame(self.bar, bg=GUI_PANEL)
+            ports.pack(side="top", fill="x", padx=10, pady=(5, 0))
+            label(ports, "MIDI in").pack(side="left")
+            self.in_box = ttk.Combobox(ports, state="readonly", width=18)
+            self.in_box.pack(side="left", padx=(5, 10))
+            label(ports, "out").pack(side="left")
+            self.out_box = ttk.Combobox(ports, state="readonly", width=18)
+            self.out_box.pack(side="left", padx=(5, 8))
+            self.connect_btn = ttk.Button(ports, text="Connect",
+                                          command=self._connect)
+            self.connect_btn.pack(side="left")
+            ttk.Button(ports, text="⟳", width=3, command=self._rescan).pack(
+                side="left", padx=(5, 0))
+
+        row = tk.Frame(self.bar, bg=GUI_PANEL)
+        row.pack(side="top", fill="x", padx=10, pady=(5, 6))
+        self.invert_var = tk.BooleanVar(value=self.invert)
+        self.flip_var = tk.BooleanVar(value=self.flip)
+        self.top_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="invert", variable=self.invert_var,
+                        command=self._invert_changed).pack(side="left")
+        ttk.Checkbutton(row, text="flip", variable=self.flip_var,
+                        command=self._flip_changed).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(row, text="on top", variable=self.top_var,
+                        command=self._top_changed).pack(side="left", padx=(8, 0))
+        if self.args.external:
+            label(row, "fps").pack(side="left", padx=(14, 0))
+            self.fps_box = ttk.Spinbox(row, from_=1, to=30, width=3,
+                                       command=self._fps_changed)
+            self.fps_box.set(str(max(1, min(30, self.args.framerate or 30))))
+            self.fps_box.pack(side="left", padx=(5, 0))
+            self.fps_box.bind("<Return>", lambda e: self._fps_changed())
+            self.fps_box.bind("<FocusOut>", lambda e: self._fps_changed())
+        self.record_btn = ttk.Button(row, text="Record", width=10,
+                                     command=self._toggle_record)
+        if self.args.external:
+            self.record_btn.pack(side="right")      # primary action, far right
+        self.snap_btn = ttk.Button(row, text="Snapshot", command=self._snapshot)
+        self.snap_btn.pack(side="right", padx=(0, 6))
+
+        # A line that is always there: a message when there is one, otherwise
+        # the keys, which is the only place they are discoverable from inside
+        # the window.
+        self.message = tk.Label(self.bar, text="", bg=GUI_PANEL, fg=GUI_ACCENT,
+                                font=self.mono, anchor="w")
+        self.message.pack(side="top", fill="x", padx=10, pady=(0, 7))
+        self._hint = ("s snapshot   ·   r record   ·   i invert   ·   f flip"
+                      "   ·   F11 fullscreen" if self.args.external else
+                      "s snapshot   ·   i invert   ·   f flip   ·   space pause"
+                      "   ·   F11 fullscreen")
+        self.message.configure(text=self._hint, fg=GUI_DIM)
+
+        self.canvas = tk.Canvas(self.root, bg="#000000", bd=0,
+                                highlightthickness=1, highlightcolor=GUI_LINE,
+                                highlightbackground=GUI_LINE, width=w, height=h)
+        self.canvas.pack(side="top", fill="both", expand=True)
+        self._item = self.canvas.create_image(0, 0, anchor="nw")
+        self.canvas.bind("<Configure>", self._on_resize)
+
+    def _bind(self, tk):
+        root = self.root
+        root.bind("<Key>", self._on_key)
+        root.bind("<F11>", lambda e: self._fullscreen(True))
+        root.bind("<Escape>", lambda e: self._fullscreen(False))
+        root.bind("<Control-q>", lambda e: self.quit())
+
+    # ------------------------------------------------------------------ ports
+
+    def _rescan(self, select=True):
+        try:
+            self.in_ports, self.out_ports = _midi_ports()
+        except SystemExit:
+            # _rtmidi() has already said why on stderr; say it here too, because
+            # a window with no terminal behind it would otherwise look fine and
+            # do nothing.
+            self._flash("python-rtmidi is not installed — pip install "
+                        "python-rtmidi")
+            self.in_ports, self.out_ports = [], []
+            return
+        self.in_box.configure(values=port_labels(self.in_ports))
+        self.out_box.configure(values=port_labels(self.out_ports))
+        if select:
+            self._preselect()
+
+    def _preselect(self):
+        """What the command line or the environment asked for, else the obvious.
+
+        The obvious is the port carrying the instrument's own name -- on Linux
+        that is the USB interface, which is what anyone means. Falling back to
+        the first port is a guess, but a visible one: it is in the box.
+        """
+        pair = ((self.args.midi_in, self.in_ports, self.in_box),
+                (self.args.midi_out, self.out_ports, self.out_box))
+        for spec, names, box in pair:
+            if not names:
+                box.set("")
+                continue
+            idx = None
+            if spec:
+                try:
+                    idx = resolve_port(spec, names, "midi")
+                except SystemExit:
+                    idx = None
+            if idx is None:
+                needle = self.instrument.name.lower()
+                idx = next((i for i, n in enumerate(names)
+                            if needle in n.lower()), None)
+            if idx is None:
+                idx = 0
+            box.current(idx)
+
+    def _connect(self):
+        if self.in_box is None:
+            return
+        if self.live is not None:
+            self._disconnect()
+            return
+        i, o = self.in_box.current(), self.out_box.current()
+        if i < 0 or o < 0:
+            self._flash("pick a MIDI input and output first")
+            return
+        try:
+            midi_in, midi_out = open_ports(str(o), str(i), self.args.verbose)
+        except SystemExit:
+            self._flash("could not open those ports — see the terminal")
+            return
+        self.live = LiveSource(self.instrument, midi_in, midi_out,
+                               fps=self._fps(), timeout=self.args.timeout)
+        self.live.start()
+        self.connect_btn.configure(text="Disconnect")
+        self._flash("connected")
+
+    def _disconnect(self):
+        if self.recording:
+            self._toggle_record()
+        if self.live is not None:
+            self.live.stop()
+            self.live = None
+        self.connect_btn.configure(text="Connect")
+
+    # ------------------------------------------------------------------ frame
+
+    def _draw(self):
+        if self.grid is None:
+            return
+        grid = self.grid[::-1] if self.flip else self.grid
+        png = png_bytes(grid, self.scale, self.invert)
+        w = len(grid[0]) * self.scale if grid else 0
+        h = len(grid) * self.scale
+        if self._photo is None or (self._photo.width(), self._photo.height()) \
+                != (w, h):
+            self._photo = self.tk.PhotoImage(data=base64.b64encode(png)
+                                             .decode("ascii"))
+            self.canvas.itemconfigure(self._item, image=self._photo)
+        else:
+            # reconfiguring in place is what keeps a 30 fps redraw at a couple of
+            # milliseconds: no image churn, no flicker
+            self._photo.configure(data=base64.b64encode(png).decode("ascii"))
+        self._centre()
+
+    def _centre(self):
+        if self._photo is None:
+            return
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            return
+        self.canvas.coords(self._item,
+                           (cw - self._photo.width()) // 2,
+                           (ch - self._photo.height()) // 2)
+
+    def _on_resize(self, event=None):
+        if self._fit_job is None:
+            self._fit_job = self.root.after(60, self._fit)   # one encode per drag
+
+    def _fit(self):
+        self._fit_job = None
+        cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+        if cw < 2 or ch < 2:
+            return
+        scale = max(1, min(cw // self.instrument.width,
+                           ch // self.instrument.height))
+        if scale != self.scale:
+            self.scale = scale
+            self._draw()
+        else:
+            self._centre()
+
+    # ------------------------------------------------------------------- tick
+
+    def _tick(self):
+        self._after = None
+        try:
+            self._tick_once()
+        except Exception:
+            # One bad frame must not take the window down with it: the loop is
+            # the only thing redrawing, so an exception escaping here would
+            # freeze a picture that is still arriving.
+            traceback.print_exc()
+            self._flash("internal error -- see the terminal", 10.0)
+        finally:
+            self._after = self.root.after(16, self._tick)
+
+    def _tick_once(self):
+        while True:
+            try:
+                self._flash(self._messages.get_nowait())
+            except queue.Empty:
+                break
+        now = time.monotonic()
+        if self.live is not None:
+            grid, seq = self.live.take()
+            if seq != self._seq:
+                self._seq = seq
+                self.grid = grid
+                self._draw()
+        elif self.replay is not None:
+            grid, _ = self.replay.at(now)
+            if grid is not self._replay_grid:
+                self._replay_grid = grid
+                self.grid = grid
+                self._draw()
+        if now - self._status_at > 0.2:
+            self._status_at = now
+            self._update_status()
+
+    def _update_status(self):
+        now = time.monotonic()
+        if self.recording:
+            secs = int(now - self.rec_started)
+            self.rec_label.configure(text=f"● REC  {secs // 60}:{secs % 60:02d}")
+        else:
+            self.rec_label.configure(text="")
+        if now > self._message_until and self.message.cget("text") != self._hint:
+            self.message.configure(text=self._hint, fg=GUI_DIM)
+
+        if self.live is None and self.replay is None:
+            self.chip.configure(text="IDLE", fg=GUI_DIM)
+            self.counters.configure(text="not connected" if (self.in_ports or
+                                     self.out_ports) else "no MIDI ports found")
+            return
+
+        if self.live is not None:
+            if self.live.error:
+                self.chip.configure(text="ERROR", fg=GUI_REC)
+                self.counters.configure(text=self.live.error)
+                return
+            if self.live.last_ok is None:
+                self.chip.configure(text="WAITING", fg=GUI_ACCENT)
+                self.counters.configure(text="no reply yet")
+                return
+            held = now - self.live.last_ok
+            stale = held > max(1.0, 3.0 / self.live.fps)
+            self.chip.configure(text="NO REPLY" if stale else "LIVE",
+                                fg=GUI_REC if stale else GUI_ACCENT)
+            elapsed = max(1e-6, now - self.live.started)
+            text = (f"{self.live.polled / elapsed:4.1f} fps   "
+                    f"{self.live.polled} polled   {self.live.kept} kept   "
+                    f"{elapsed:5.1f} s")
+            if self.live.misses:
+                text += f"   {self.live.misses} timed out"
+            if stale:
+                text += f"   picture is {held:.1f} s old"
+            self.counters.configure(text=text)
+        else:
+            _, t = self.replay.at(now)
+            total = self.replay.end_ms / 1000.0
+            self.chip.configure(text="PAUSED" if self.replay.paused else "REPLAY",
+                                fg=GUI_DIM if self.replay.paused else GUI_ACCENT)
+            if total > 0:
+                self.counters.configure(
+                    text=f"{t / 1000:5.1f} s / {total:.1f} s   ·   "
+                         f"space pauses")
+            else:
+                self.counters.configure(text="single frame")
+
+    # --------------------------------------------------------------- controls
+
+    def _flash(self, text, seconds=6.0):
+        self.message.configure(text=text, fg=GUI_ACCENT)
+        self._message_until = time.monotonic() + seconds
+
+    def _flash_threadsafe(self, text):
+        self._messages.put(text)
+
+    def _fps(self):
+        if self.fps_box is None:
+            return 30
+        try:
+            return max(1, min(30, int(self.fps_box.get())))
+        except (TypeError, ValueError):
+            return 30
+
+    def _fps_changed(self):
+        fps = self._fps()
+        self.fps_box.set(str(fps))
+        if self.live is not None:
+            self.live.fps = fps
+
+    def _invert_changed(self):
+        self.invert = bool(self.invert_var.get())
+        self._draw()
+
+    def _flip_changed(self):
+        self.flip = bool(self.flip_var.get())
+        self._draw()
+
+    def _top_changed(self):
+        self.root.attributes("-topmost", bool(self.top_var.get()))
+
+    def _toggle_invert(self):
+        self.invert_var.set(not self.invert_var.get())
+        self._invert_changed()
+
+    def _toggle_flip(self):
+        self.flip_var.set(not self.flip_var.get())
+        self._flip_changed()
+
+    def _fullscreen(self, on):
+        self.root.attributes("-fullscreen", on)
+        if on:
+            self.bar.pack_forget()
+        else:
+            self.bar.pack(side="bottom", fill="x")
+        if self._fit_job is None:
+            self._fit_job = self.root.after(80, self._fit)
+
+    def _on_key(self, event):
+        widget = self.root.focus_get()
+        if widget is not None and widget.winfo_class() in (
+                "TCombobox", "TSpinbox", "Entry", "TEntry", "Spinbox",
+                "Listbox"):
+            return
+        if event.char == " " and self.replay is not None:
+            if widget is None or widget.winfo_class() not in ("TButton", "Button"):
+                self.replay.toggle_pause(time.monotonic())   # not a button press
+        action = {"s": self._snapshot, "r": self._toggle_record,
+                  "i": self._toggle_invert, "f": self._toggle_flip,
+                  "q": self.quit}.get(event.char)
+        if action is not None:
+            action()
+
+    # -------------------------------------------------------------- snapshots
+
+    def _snapshot(self):
+        if self.grid is None:
+            self._flash("nothing on screen yet")
+            return
+        grid = self.grid[::-1] if self.flip else self.grid
+        path = os.path.abspath(
+            f"screendump-{time.strftime('%Y%m%d-%H%M%S')}.png")
+        with open(path, "wb") as fh:
+            fh.write(png_bytes(grid, self.scale, self.invert))
+        self._flash(f"wrote {os.path.basename(path)}")
+
+    def _toggle_record(self):
+        if self.live is None:
+            self._flash("connect first — recording needs frames")
+            return
+        if not self.recording:
+            self.live.begin_recording()
+            self.recording = True
+            self.rec_started = time.monotonic()
+            self.record_btn.configure(text="Stop  ●")
+            self._flash("recording")
+            return
+        self.recording = False
+        self.record_btn.configure(text="Record")
+        frames, end_ms, polled = self.live.end_recording()
+        if not frames:
+            self._flash("nothing recorded — no frames arrived")
+            return
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        mid = os.path.abspath(f"screendump-{stamp}.mid")
+        write_smf(mid, frames, end_ms)
+        gif = mid[:-4] + ".gif"
+        # Say the GIF is coming BEFORE the wait, not after it. The write takes
+        # seconds -- roughly a fifth of the recording's length -- and a folder
+        # holding a .mid and no .gif for that long reads as a refusal to write
+        # one. The elapsed figure only counts once the file exists.
+        self._flash(f"{os.path.basename(mid)}: {len(frames)} frames, "
+                    f"{end_ms / 1000:.1f} s — writing the GIF, give it a few "
+                    f"seconds", 120.0)
+        self._gif_job = threading.Thread(
+            target=self._write_gif,
+            args=(gif, frames, end_ms, polled), daemon=False)
+        self._gif_job.start()
+
+    def _write_gif(self, path, frames, end_ms, polled):
+        """The GIF is the slow half, so it is written off the Tk thread."""
+        opts = argparse.Namespace(upscale=self.args.upscale,
+                                  invert=self.invert, flip=self.flip)
+        try:
+            write_animation(path, durations_from(frames, end_ms),
+                            self.instrument, opts)
+            self._flash_threadsafe(f"wrote {os.path.basename(path)}")
+        except Exception as exc:
+            # A one-line flash is not enough on its own: it fades, and it says
+            # nothing about why. The terminal keeps the traceback, because a
+            # silent background failure looks exactly like a slow one.
+            traceback.print_exc()
+            self._flash_threadsafe(f"GIF failed: {exc} — see the terminal")
+
+    # ------------------------------------------------------------------- quit
+
+    def quit(self):
+        if self._closing:       # Ctrl+Q and the window button can both land
+            return
+        self._closing = True
+        try:
+            if self.recording:
+                self._toggle_record()
+        finally:
+            if self._after is not None:
+                self.root.after_cancel(self._after)
+                self._after = None
+            if self.live is not None:
+                self.live.stop()
+                self.live = None
+            # The GIF is written on a thread. Quitting on top of it would kill
+            # the process mid-file, so give it the moment it needs -- the .mid
+            # is already on disk either way.
+            # The GIF is written on a thread of its own. It is NOT a daemon, so
+            # closing the window -- or Ctrl+C -- waits for the file instead of
+            # killing the write midway and leaving no .gif at all. The .mid is
+            # already on disk either way.
+            if self._gif_job is not None and self._gif_job.is_alive():
+                warn("still writing the GIF -- the window closes when it is "
+                     "done; the .mid is already saved")
+                self._gif_job.join()
+            self.root.destroy()
+
+    def run(self):
+        self.root.after(16, self._tick)
+        self.root.mainloop()
+        return 0
+
+
+def gui(instrument, args):
+    if not (args.external or args.from_file):
+        die("--gui needs something to show: -x for the instrument itself, or "
+            "--from-file for a recording.\n"
+            "    screendump -x --gui\n"
+            "    screendump --from-file cap.mid --gui")
+    for flag, val in (("--save-mid", args.save_mid), ("--save-gif", args.save_gif),
+                      ("--save-syx", args.save_syx), ("--save-raw", args.save_raw)):
+        if val:                     # the button writes its own names
+            warn(f"{flag} is ignored by the window — use Record or Snapshot")
+
+    tk, ttk, font = _tkinter()
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        die(f"cannot open a window: {exc}\n"
+            "    That needs a desktop session. Over ssh, -X forwards one.")
+    replay = ReplaySource(args.from_file, instrument) if args.from_file else None
+    return ScreenWindow(root, tk, ttk, font, instrument, args, replay).run()
 
 
 # -------------------------------------------------------------------- main
@@ -1565,6 +2495,10 @@ def main():
                            "round-trip times, sustained fps, wire throughput "
                            "(SENDS MIDI)")
 
+    ap.add_argument("--gui", action="store_true",
+                    help="show the screen in a window instead of the terminal: "
+                         "live with -x, or a replay with --from-file. Needs "
+                         "tkinter (python3-tk on Debian/Ubuntu)")
     ap.add_argument("--instrument", default=os.environ.get("SCREENDUMP_INSTRUMENT"),
                     help="which instrument, spelled exactly: "
                          + " / ".join(i.short for i in implemented())
@@ -1629,6 +2563,17 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
+    if args.gui and (args.list_midi or args.list_audio or args.self_test
+                     or args.emit_sample or args.bench):
+        die("--gui is a mode of its own -- it cannot be combined with "
+            "--list-midi, --list-audio, --self-test, --emit-sample or --bench.")
+    if args.gui and (args.save_audio or args.save_video):
+        die("--save-audio and --save-video are not available from the window "
+            "yet.\n"
+            "    Record a .mid with the Record button, then, from the same "
+            "folder:\n"
+            "    screendump --from-file clip.mid --save-gif clip.gif")
+
     if args.list_midi:
         list_midi()
         return 0
@@ -1675,6 +2620,9 @@ def main():
 
     if args.self_test:
         return self_test(args, inst)
+
+    if args.gui:
+        return gui(inst, args)
 
     if args.emit_sample:
         frame = build_response(inst, pack(synthetic_grid(inst),
