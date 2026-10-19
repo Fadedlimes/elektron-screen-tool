@@ -324,11 +324,3 @@ screendump --trace --midi-in 1 --midi-out 1 --probe-id "0c 00"
    ```
 4. If the preview image printed in your terminal matches what is on your screen, submit these two files via a [New Device Issue](https://github.com/Fadedlimes/elektron-screen-tool/issues/new/choose) to have your model added to the supported table.
 ```
-
-***
-
-### Key Improvements Made:
-1. **Eliminated Awkward Metaphors & Rambling:** Removed informal phrases like *"turns to mush"*, *"nothing puts a command on your path unless you ask it to"*, and long-winded clock explanations.
-2. **Clarified Port & Software Locks:** Specifically named the **Elektron Transfer** application rather than just "Transfer", preventing user confusion when troubleshooting unresponsive ports.
-3. **Structured Technical Requirements:** Grouped dependencies into clear core vs. optional tables so users immediately know what to install for audio, video, or the GUI.
-4. **Improved Grammar & Readability:** Cleaned up run-on sentences, missing conjunctions, and awkward passive phrasing throughout the command descriptions and guide sections.
