@@ -1,6 +1,9 @@
-# screendump
+# screendump / Elektron-Screen-Tool
 
 See your Elektron instrument's screen in the terminal — or in a window.
+
+<img width="512" height="256" alt="screendump-20261018-223646" src="https://github.com/user-attachments/assets/80953731-1989-4879-9edf-70e444fa57ab" />
+
 
 It uses the instrument's own screenshot command over MIDI. **Nothing on the
 instrument is modified** — no firmware change, no flashing.
@@ -53,6 +56,12 @@ $ screendump -x --instrument dtii --midi-in dtii --midi-out dtii --blocks
 A real 128 × 64 screen, unretouched — the Digitakt's SRC page, with `LEV`,
 `STRT`, `LEN`, `LOOP` and `LEV` under their knobs. The command behind it, ports
 and all, is under [Run it](#run-it).
+
+
+
+GUI Example:
+
+<img width="637" height="395" alt="image" src="https://github.com/user-attachments/assets/3919b82a-0fa6-42c1-83cf-c921e17b14ba" />
 
 ## Run it
 
