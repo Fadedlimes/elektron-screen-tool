@@ -15,7 +15,7 @@ Works on macOS and Linux. Windows awaits a tester.
 
 
 ```
-$ screendump -x --blocks
+$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii --blocks
 ▄█████████████▄   ██  ██ ██  ██ ██████ ██████ ██████ ██     ██████ █████▄   ▄██████████████████████████████████████████████████▄
 ██ ▄▀█▀▄▀█▀▄▀██   ██  ██ ███▄██   ██     ██     ██   ██     ██     ██  ██   █████████████████████████▀▄▄▀▄██▀ ██ █▀█▀▄▀███▀▄▀███
 ██ ▀▄█ █ ██▀▄██   ██  ██ ██ ▀██   ██     ██     ██   ██     ████   ██  ██   ████████████████████████▀▄█▀▄▀███ ██ ▀ █ █ ███ █ ███
@@ -51,7 +51,8 @@ $ screendump -x --blocks
 ```
 
 A real 128 × 64 screen, unretouched — the Digitakt's SRC page, with `LEV`,
-`STRT`, `LEN`, `LOOP` and `LEV` under their knobs.
+`STRT`, `LEN`, `LOOP` and `LEV` under their knobs. The command behind it, ports
+and all, is under [Run it](#run-it).
 
 ## Run it
 
@@ -82,6 +83,38 @@ need Python 3, which Linux ships as `python3`.
 
 ⚠️ **Snapshot and Record write into the folder you started from**, not next to
 the script. Start it somewhere you will find the files again.
+
+### What every command needs
+
+`--instrument` is required and has no default: the machine decides what goes on
+the wire, so the tool will not guess. Leave it out and it stops with *"no
+instrument selected"* — which is the usual reason a first run appears to do
+nothing at all.
+
+**The window** needs only that one, because it finds its own ports:
+
+```
+screendump -x --instrument dtii --gui
+```
+
+The terminal modes need the two ports as well, either named:
+
+```
+screendump -x --instrument dtii --midi-in dtii --midi-out dtii --blocks
+```
+
+or set all three once, after which the shorter examples further down work as
+written:
+
+```
+export SCREENDUMP_INSTRUMENT=dtii     # DT, DTII, DN -- see Instruments
+export SCREENDUMP_MIDI_IN=dtii        # or an index from --list-midi
+export SCREENDUMP_MIDI_OUT=dtii
+```
+
+The instrument can be written any accepted way, and a port takes an index, an
+instrument short form, or part of a port name. [Set it once per
+session](#set-it-once-per-session) has the detail, including other shells.
 
 ## Install
 
@@ -141,7 +174,7 @@ send. See [Instruments](#instruments).
 Output goes to stdout, so it pipes and tees like anything else:
 
 ```
-$ screendump -x --blocks | tee shot.txt
+$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii --blocks | tee shot.txt
 ```
 
 That keeps one fixed rendering, as characters. To keep the **data** instead,
@@ -149,9 +182,9 @@ save the frame and re-open it — the pixels are still there, so you can render
 them differently afterwards without going back to the instrument:
 
 ```
-$ screendump -x --save-syx shot.syx
-$ screendump --from-file shot.syx --blocks
-$ screendump --from-file shot.syx --ascii --invert
+$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii --save-syx shot.syx
+$ screendump --instrument dtii --from-file shot.syx --blocks
+$ screendump --instrument dtii --from-file shot.syx --ascii --invert
 ```
 
 ## Live view and recording
@@ -188,7 +221,8 @@ of 30.
 ### Record while you watch
 
 ```
-$ screendump -x --framerate 15 --save-mid cap.mid --save-gif out.gif
+$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii \
+             --framerate 15 --save-mid cap.mid --save-gif out.gif
                                     ... live view here, Ctrl+C to stop ...
 screendump: 255 polled, 101 kept, 18.1 s
 screendump: wrote 101 frames to cap.mid
@@ -204,7 +238,7 @@ Add `-H` / `--hide` to record without drawing anything.
 ### Or make the GIF afterwards
 
 ```
-$ screendump --from-file cap.mid --save-gif out.gif
+$ screendump --instrument dtii --from-file cap.mid --save-gif out.gif
 ```
 
 A `.mid` keeps every frame and its timing, so you can come back to a recording
@@ -225,7 +259,7 @@ A terminal live view is for you. A window is for a video recorder: OBS can
 capture it, and the screen is drawn at whatever size the window is.
 
 ```
-$ screendump -x --gui
+$ screendump -x --instrument dtii --gui
 ```
 
 The window needs **tkinter**, which is part of Python but is packaged
@@ -260,7 +294,7 @@ Point it at a recording and it plays back at the speed it was captured — which
 is also the way to try the window on a machine with no MIDI ports at all.
 
 ```
-$ screendump --from-file cap.mid --gui
+$ screendump --instrument dtii --from-file cap.mid --gui
 ```
 
 ⚠️ The window records **picture only**. Record writes a `.mid` and a `.gif`;
@@ -302,14 +336,14 @@ same interface is listed once per host API on Windows, so `--audio-in
 **Record picture and sound together:**
 
 ```
-$ screendump -x --framerate 30 --audio-in dt \
-             --save-mid cap.mid --save-audio cap.wav
+$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii \
+             --framerate 30 --audio-in dt --save-mid cap.mid --save-audio cap.wav
 ```
 
 **Then turn the pair into a video:**
 
 ```
-$ screendump --from-file cap.mid --from-audio cap.wav --save-video out.mp4
+$ screendump --instrument dtii --from-file cap.mid --from-audio cap.wav --save-video out.mp4
 ```
 
 Video takes **two** inputs, because the two halves are recorded separately: a
@@ -320,7 +354,8 @@ sample, so both files share an origin.
 Or do it in one go, and skip the intermediate files:
 
 ```
-$ screendump -x --framerate 30 --audio-in dt --save-video out.mp4
+$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii \
+             --framerate 30 --audio-in dt --save-video out.mp4
 ```
 
 Encoding is the slow part of a long recording — two minutes at the default size
