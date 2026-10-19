@@ -323,4 +323,3 @@ screendump --trace --midi-in 1 --midi-out 1 --probe-id "0c 00"
    screendump-trace-YYYYMMDD-HHMMSS.syx
    ```
 4. If the preview image printed in your terminal matches what is on your screen, submit these two files via a [New Device Issue](https://github.com/Fadedlimes/elektron-screen-tool/issues/new/choose) to have your model added to the supported table.
-```
