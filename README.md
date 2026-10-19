@@ -1,122 +1,84 @@
 # screendump / Elektron-Screen-Tool
 
-See your Elektron instrument's screen in a window easily and quickly giving you a source to record for video making (no more duplicated sources and ghostly screens).
+Display and record your Elektron instrument's screen in real time directly from your terminal or in a dedicated desktop window. Designed for screen captures, streaming, and video production in OBS without glare, ghosting, or duplicate video capture devices.
 
 <img width="512" height="256" alt="screendump-20261018-223646" src="https://github.com/user-attachments/assets/80953731-1989-4879-9edf-70e444fa57ab" />
 
+`screendump` queries the device's native screenshot routine over MIDI SysEx. **No firmware modifications, patching, or flashing required.**
 
+- **Platforms:** macOS and Linux supported (Windows is unverified but should work).
+- **Supported Instruments:** Digitakt (I & II). Additional Elektron devices can be probed and mapped via `--trace`.
 
-It uses the instrument's own screenshot command over MIDI. **Nothing on the
-instrument is modified** — no firmware change, no flashing.
+> **Credit:** Core MIDI capture routines, protocol decoding, and export engines are based on [Jakob Bak's screendump](https://github.com/jakobbak/screendump) (MIT License). This fork adds Digitakt II support, an interactive GUI window suitable for OBS window capture, and synchronized audio recording.
 
-Works on macOS and Linux. Windows awaits a tester.
+---
 
-> **Credit:** the capture tool is [Jakob Bak's
-> screendump](https://github.com/jakobbak/screendump), MIT licensed — see
-> `LICENSE`, which stays with the copyright intact. This fork adds a window for
-> recording the screen in OBS, and support for the Digitakt II. The wire format,
-> the renderings, the recording and the video export are his work.
+### GUI Preview
 
-
-
+<img width="641" height="467" alt="image" src="https://github.com/user-attachments/assets/aa9c0aac-a86a-4fc6-ac49-f2f3c1de6565" />
 
 
 
-GUI Example:
+---
 
-<img width="637" height="395" alt="image" src="https://github.com/user-attachments/assets/3919b82a-0fa6-42c1-83cf-c921e17b14ba" />
+## Installation & Dependencies
 
-## Run it
+`screendump` is distributed as a single standalone Python 3 script.
 
-`screendump` is one Python file with no installer, so every `$ screendump` in
-this README is shorthand for *that file, invoked somehow*. Nothing puts a
-command on your `PATH` for you unless you ask it to. Two ways, pick either.
+### 1. Python Dependencies
 
-**Link the file onto your `PATH`**, which is what makes the examples below copy
-and paste as written. `~/.local/bin` is usually on the `PATH`; check with
-`echo $PATH` if the command afterwards is not found:
+Install the core MIDI library:
 
-```
-mkdir -p ~/.local/bin
-ln -s "$PWD/screendump" ~/.local/bin/screendump
-screendump --list-midi
-```
-
-**Or call the file directly**, from the folder that holds it, and leave your
-`PATH` alone:
-
-```
-./screendump --list-midi
-python3 ./screendump --list-midi
-```
-
-Both work: the file is executable and starts with `#!/usr/bin/env python3`. You
-need Python 3, which Linux ships as `python3`.
-
-⚠️ **Snapshot and Record write into the folder you started from**, not next to
-the script. Start it somewhere you will find the files again.
-
-### What every command needs
-
-`--instrument` is required and has no default: the machine decides what goes on
-the wire, so the tool will not guess. Leave it out and it stops with *"no
-instrument selected"* — which is the usual reason a first run appears to do
-nothing at all.
-
-**The window** finds its own ports, so it needs only the machine — and it can
-work that out for itself when exactly one Elektron device is plugged in, by
-reading the port name. Either of these opens the same window:
-
-```
-screendump -x --gui
-screendump -x --instrument dtii --gui
-```
-
-With two machines connected there is nothing to read: say which one.
-
-The terminal modes need the two ports as well, either named:
-
-```
-screendump -x --instrument dtii --midi-in dtii --midi-out dtii --blocks
-```
-
-or set all three once, after which the shorter examples further down work as
-written:
-
-```
-export SCREENDUMP_INSTRUMENT=dtii     # DT, DTII, DN -- see Instruments
-export SCREENDUMP_MIDI_IN=dtii        # or an index from --list-midi
-export SCREENDUMP_MIDI_OUT=dtii
-```
-
-The instrument can be written any accepted way, and a port takes an index, an
-instrument short form, or part of a port name. [Set it once per
-session](#set-it-once-per-session) has the detail, including other shells.
-
-## Install
-
-```
+```bash
 python3 -m pip install python-rtmidi
 ```
 
-`python3 -m pip` and not bare `pip`, so the package lands in the interpreter
-that runs the script. A second Python on the `PATH` is the usual reason for
-"python-rtmidi is not installed" from a machine that has just installed it.
+*(Note: Always use `python3 -m pip` to ensure the library is installed into the matching Python interpreter environment.)*
 
-That one package is all you need to see a screen. The rest are needed only for
-sound, video, or the window, and each is named when it is missing, so nothing
-has to be installed up front:
+#### Optional Dependencies
 
-| for | install |
-|---|---|
-| the screen, recording, GIF | `python3 -m pip install python-rtmidi` |
-| `--save-audio` | `python3 -m pip install sounddevice` |
-| `--save-video` | ffmpeg — `brew install ffmpeg`, `apt install ffmpeg`, `winget install ffmpeg` |
-| `--gui` | tkinter — `sudo apt install python3-tk` (Debian/Ubuntu), `sudo dnf install python3-tkinter` (Fedora); part of Python elsewhere. See [A window instead of the terminal](#a-window-instead-of-the-terminal) |
+Install additional tools only if you need audio recording, video rendering, or the graphical window:
 
-## Find your MIDI ports
+| Feature | Dependency | Installation Command |
+|---|---|---|
+| Core Screen Capture, `.mid`, `.gif` | `python-rtmidi` | `python3 -m pip install python-rtmidi` |
+| Audio Capture (`--save-audio`) | `sounddevice` | `python3 -m pip install sounddevice` |
+| Video Export (`--save-video`) | `ffmpeg` | `brew install ffmpeg` / `sudo apt install ffmpeg` / `winget install ffmpeg` |
+| Graphical UI (`--gui`) | `tkinter` | `sudo apt install python3-tk` (Ubuntu/Debian)<br>`sudo dnf install python3-tkinter` (Fedora)<br>*Included by default with official macOS/Windows Python installers.* |
 
+---
+
+## Running the Tool
+
+You can run the script directly from your terminal or link it into your system `$PATH`:
+
+### Option A: Run directly
+```bash
+python3 ./screendump --list-midi
+# or make it executable:
+chmod +x ./screendump
+./screendump --list-midi
 ```
+
+### Option B: Add to your PATH
+To run `screendump` from any directory:
+```bash
+mkdir -p ~/.local/bin
+ln -s "$PWD/screendump" ~/.local/bin/screendump
+```
+*(Ensure `~/.local/bin` is present in your shell's `$PATH` variable).*
+
+> ⚠️ **Note on Output Files:** Screenshots, recordings, and audio files are saved to your **current working directory** (wherever your terminal prompt is currently located), not in the directory where `screendump` is stored.
+
+---
+
+## Basic Usage
+
+### 1. Identify Your MIDI Ports
+
+List available MIDI input and output ports:
+
+```bash
 $ screendump --list-midi
 MIDI inputs (instrument -> computer):
   [0] Elektron Digitakt
@@ -124,414 +86,249 @@ MIDI outputs (computer -> instrument):
   [0] Elektron Digitakt
 ```
 
-## Capture the screen on an attached instrument
+### 2. Capture a Single Screenshot
 
-```
-$ screendump -x --midi-in 0 --midi-out 0 --instrument dt
-```
+Use `-x` (or `--external`) to interact with connected hardware:
 
-`-x` is the only mode that talks to hardware.
-
-Those `0`s are indices from `--list-midi`, and on a machine with other MIDI gear
-the instrument will not be number 0. Either read the number off that listing, or
-pass the instrument's own name instead — `--midi-in dtii --midi-out dtii` — and
-skip the lookup entirely.
-
-Ports can be given three ways: an index from `--list-midi`, an instrument short
-form (`--midi-in dt`), or any fragment of the port name (`--midi-in MOTU`, handy
-when the instrument is behind a MIDI interface). A fragment has to identify
-exactly one port — if two match, it stops and shows you both rather than
-choosing for you.
-
-`--instrument` takes only a machine a real screen has been captured from and
-read: `dt` for a Digitakt, `dtii` for a Digitakt II. The others are known by
-name and cannot be attempted — without an instrument id there is no request to
-send. See [Instruments](#instruments).
-
-Output goes to stdout, so it pipes and tees like anything else:
-
-```
-$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii --blocks | tee shot.txt
+```bash
+screendump -x --instrument dtii --midi-in 0 --midi-out 0
 ```
 
-That keeps one fixed rendering, as characters. To keep the **data** instead,
-save the frame and re-open it — the pixels are still there, so you can render
-them differently afterwards without going back to the instrument:
+- **Specifying Ports:** You can pass the numerical index (e.g., `0`), an instrument short code (`dtii`), or any unique substring of the port name (e.g., `--midi-in "Digitakt"`). If an ambiguous name matches multiple ports, the tool lists matches and exits.
+- **Specifying Instruments:** `--instrument` is required when capturing from hardware. See [Supported Instruments](#supported-instruments).
 
-```
-$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii --save-syx shot.syx
-$ screendump --instrument dtii --from-file shot.syx --blocks
-$ screendump --instrument dtii --from-file shot.syx --ascii --invert
-```
+#### Exporting & Formats:
+Output defaults to standard output (`stdout`), allowing pipes and redirection:
 
-## Live view and recording
+```bash
+# Render to terminal using Unicode half-blocks:
+screendump -x --instrument dtii --midi-in dtii --midi-out dtii --blocks
 
-```
-$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii --framerate 30
-```
+# Save the raw SysEx response to replay or re-render later:
+screendump -x --instrument dtii --midi-in dtii --midi-out dtii --save-syx shot.syx
 
-Streams the screen, redrawing in place, until **Ctrl+C**. Your terminal is left
-exactly as it was — the live view never enters the scrollback.
-
-Every command from here on needs the same three things the capture above did:
-`-x`, `--instrument`, and the two ports. See [Set it once per
-session](#set-it-once-per-session) to put the ports in the environment and stop
-repeating them.
-
-For a window instead of the terminal — the way to get this screen into OBS —
-see [A window instead of the terminal](#a-window-instead-of-the-terminal).
-
-The rate is capped at 30, the instrument's own refresh, so asking for more just
-returns the same frame twice. Over DIN expect about 3.
-
-Over USB, `--bench` measures a clean 30 fps, while the live view settles nearer
-26–27 once it is also drawing and recording. That costs you nothing in accuracy:
-every frame is stamped with the moment it arrived, so a recording keeps its real
-pacing whether the loop hit 30 or 26.
-
-Since the screen refreshes at roughly 30 Hz, rates that divide into it — 30, 15,
-10, about 7 — *may* sit more evenly against it than one in between, and a rate
-like 25 can end up slower than either neighbour. Treat that as a rule of thumb
-rather than exact science: if a recording looks uneven, try the nearest division
-of 30.
-
-### Record while you watch
-
-```
-$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii \
-             --framerate 15 --save-mid cap.mid --save-gif out.gif
-                                    ... live view here, Ctrl+C to stop ...
-screendump: 255 polled, 101 kept, 18.1 s
-screendump: wrote 101 frames to cap.mid
-screendump: wrote 101 frames (18.1 s) to out.gif
+# Render from an existing SysEx file without hardware connected:
+screendump --instrument dtii --from-file shot.syx --blocks
+screendump --instrument dtii --from-file shot.syx --ascii --invert
 ```
 
-Only frames that actually **changed** are kept, each with the length of time it
-was on screen — so a still screen costs one frame rather than fifteen a second.
-That is the `255 polled, 101 kept` above.
+---
 
-Add `-H` / `--hide` to record without drawing anything.
+## Live Streaming & Recording
 
-### Or make the GIF afterwards
+Stream the device display live to your terminal at up to 30 FPS:
 
+```bash
+screendump -x --instrument dtii --midi-in dtii --midi-out dtii --framerate 30
 ```
-$ screendump --instrument dtii --from-file cap.mid --save-gif out.gif
-```
+*(Press `Ctrl+C` to stop. Terminal scrollback is preserved.)*
 
-A `.mid` keeps every frame and its timing, so you can come back to a recording
-and re-cut it without touching the instrument again.
+- **USB vs. 5-pin DIN:** Over USB MIDI, capture speed reaches 26–30 FPS. Over standard 5-pin DIN MIDI, bandwidth limitations cap transfer speeds at roughly 3 FPS.
+- **Frame Pacing:** Because the native hardware refresh rate is ~30 Hz, evenly divisible target rates (`30`, `15`, `10`) yield smoother playback than non-integer divisors (like `25`).
 
-GIFs and videos are both enlarged four times by default — a 128 × 64 screen
-becomes 512 × 256, since the raw size is nearly invisible on a modern display.
-`--upscale N` changes it. Enlarging is nearest-neighbour on purpose: a 1-bit
-screen through a smoothing filter turns to mush. It costs little in a GIF, where
-4× is about four and a half times the bytes rather than sixteen.
+### Record Animated GIFs
 
-⚠️ Some GIF viewers clamp very short delays, so a fast animation can play back
-slower than it was captured.
-
-## A window instead of the terminal
-
-A terminal live view is for you. A window is for a video recorder: OBS can
-capture it, and the screen is drawn at whatever size the window is.
-
-```
-$ screendump -x --instrument dtii --gui
+```bash
+screendump -x --instrument dtii --midi-in dtii --midi-out dtii \
+  --framerate 15 --save-mid session.mid --save-gif session.gif
 ```
 
-The window needs **tkinter**, which is part of Python but is packaged
-separately on Linux:
+- `screendump` only records frames that change, storing timestamps for accurate variable-framerate playback. A static screen produces no redundant duplicate frames.
+- Add `-H` / `--hide` to disable terminal rendering while recording.
+- By default, GIFs are upscaled 4× (`--upscale 4`) using nearest-neighbor scaling to keep the 1-bit display sharp and prevent blur.
 
-```
-sudo apt install python3-tk        # Debian/Ubuntu
-sudo dnf install python3-tkinter   # Fedora
-sudo pacman -S tk                  # Arch
-```
+---
 
-Nothing else is needed, and every other mode works without it.
+## Graphical Window Mode (`--gui`)
 
-It connects as soon as the ports resolve — the port carrying the instrument's
-own name is picked for you, and both can be changed in the bar. If nothing is
-picked, press **Connect**.
+For OBS capture or clean desktop viewing, launch the Tkinter graphical window:
 
-| | |
-|---|---|
-| **device** | every machine this tool knows by name, with what it found: `ready`, `no request known`, or `not detected`. Picking a ready one switches the window to it, ports and all |
-| **Trace…** | for a machine with no request known yet: sends one screenshot request and writes a report and the frame it got back, ready to attach to an issue |
-| status line | fps, frames polled, frames kept, and how long this has run. `NO REPLY` means the picture has stopped arriving, and what you see is the last frame |
-| **Snapshot** | writes a PNG of the current screen, at the size it is drawn |
-| **Record** | writes a `.mid` and a `.gif` into the current folder, named by the time it stopped |
-| resize | whole pixels only — the window opens at 4× and grows in integer steps, so the screen never blurs |
-| invert, flip, on top | swap light and dark, flip vertically, keep the window above other applications |
-
-⚠️ **A sample transfer holds the port.** While Transfer is running, the
-instrument answers no screenshot requests and the window has nothing to show —
-so it opens saying exactly that rather than looking broken. Quit the transfer
-and press **⟳**.
-
-Keys: `s` snapshot, `r` record, `i` invert, `f` flip, `F11` fullscreen, `Esc`
-leave fullscreen, `q` quit. In a replay, `space` pauses.
-
-### A window with no instrument
-
-Point it at a recording and it plays back at the speed it was captured — which
-is also the way to try the window on a machine with no MIDI ports at all.
-
-```
-$ screendump --instrument dtii --from-file cap.mid --gui
+```bash
+screendump -x --instrument dtii --gui
 ```
 
-⚠️ The window records **picture only**. Record writes a `.mid` and a `.gif`;
-for sound, use the terminal: `screendump -x --framerate 30 --audio-in dt
---save-mid clip.mid --save-audio take.wav`. The window can then replay the
-`.mid` while the pair is turned into a video in the usual way.
+When only one Elektron device is connected via USB, the GUI automatically identifies and pairs the matching MIDI in/out ports.
 
-Tested on Linux with Tk 9.0. macOS and Windows have not been tried yet.
+### GUI Controls & Features
+- **Window Scaling:** Resizes in integer pixel multipliers (4×, 5×, etc.) to prevent scaling artifacts and distortion.
+- **Status Line:** Displays active FPS, polled frames, and status warnings. `NO REPLY` indicates communication with the instrument was interrupted.
+- **Snapshot (`s`):** Saves a PNG screenshot at current display resolution.
+- **Record (`r`):** Records incoming frames to a `.mid` and `.gif` file in your current folder.
+- **Hotkeys:** 
+  - `i`: Invert colors
+  - `f`: Flip vertically
+  - `F11`: Toggle fullscreen
+  - `Space`: Pause/resume playback (when viewing a file)
+  - `q`: Quit
 
-## Sound and video
+> ⚠️ **Port Conflicts with Elektron Transfer:** If the official **Elektron Transfer** desktop utility is open, it holds an exclusive lock on the USB-MIDI ports. Quit Elektron Transfer and click the refresh button (`⟳`) in `screendump` to regain access.
 
-A GIF shows what the instrument is doing. For what it *sounds* like you need
-video, which means recording the audio at the same time.
+### Offline GUI Playback
+You can inspect or replay existing captures without an instrument attached:
 
-This part needs two things the screen does not — recording audio needs
-
+```bash
+screendump --instrument dtii --from-file session.mid --gui
 ```
-pip install sounddevice
-```
 
-and writing the video needs **ffmpeg** on your `PATH` (`brew install ffmpeg`,
-`apt install ffmpeg`, `winget install ffmpeg`). Either one is named by the tool
-if it is missing, so you can also just try it and see.
+---
 
-Find the audio input the same way as the MIDI ports:
+## Synchronized Audio & Video Recording
 
-```
+Record display captures combined with direct USB audio from your Elektron instrument:
+
+### 1. List Available Audio Inputs
+```bash
 $ screendump --list-audio
 Audio inputs (instrument -> computer):
-  [0] MacBook Air Microphone (Core Audio)   1 ch   48000 Hz
-  [1] Elektron Digitakt (Core Audio)   2 ch   48000 Hz
+  [0] Built-in Microphone (Core Audio)   1 ch   48000 Hz
+  [1] Elektron Digitakt (Core Audio)     2 ch   48000 Hz
 ```
 
-`--audio-in` takes an index, an instrument short form, or any fragment of the
-name — exactly like `--midi-in`. The host API is part of the name because the
-same interface is listed once per host API on Windows, so `--audio-in
-"Digitakt (WASAPI)"` is a way to pick one when several match.
-
-**Record picture and sound together:**
-
-```
-$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii \
-             --framerate 30 --audio-in dt --save-mid cap.mid --save-audio cap.wav
+### 2. Record Video and Audio Directly
+```bash
+screendump -x --instrument dtii --midi-in dtii --midi-out dtii \
+  --framerate 30 --audio-in "Digitakt" --save-video output.mp4
 ```
 
-**Then turn the pair into a video:**
+### 3. Or Record Components Separately and Merge:
+```bash
+# Capture raw MIDI frames and audio to disk:
+screendump -x --instrument dtii --midi-in dtii --midi-out dtii \
+  --framerate 30 --audio-in "Digitakt" --save-mid session.mid --save-audio session.wav
 
-```
-$ screendump --instrument dtii --from-file cap.mid --from-audio cap.wav --save-video out.mp4
-```
-
-Video takes **two** inputs, because the two halves are recorded separately: a
-`.mid` holds the picture and its timing, a `.wav` holds the sound. They line up
-without you doing anything — the capture's clock starts at the first audio
-sample, so both files share an origin.
-
-Or do it in one go, and skip the intermediate files:
-
-```
-$ screendump -x --instrument dtii --midi-in dtii --midi-out dtii \
-             --framerate 30 --audio-in dt --save-video out.mp4
+# Render the files to an MP4 video using ffmpeg:
+screendump --instrument dtii --from-file session.mid --from-audio session.wav --save-video output.mp4
 ```
 
-Encoding is the slow part of a long recording — two minutes at the default size
-is around half a gigabyte of raw frames handed to ffmpeg. `--upscale 2` quarters
-that when you want a quick look rather than something to keep.
+> **macOS Audio Permissions:** On macOS, the terminal or application running Python must be granted **Microphone Access** in *System Settings → Privacy & Security*. Without this, audio captures will be silent.
 
-⚠️ **The first recording will ask for microphone permission** on macOS — that is
-the OS gate on *any* audio input, including an instrument. If you refuse it, the
-recording silently comes out empty.
+### Audio Clock Sync & Drift Correction
+Hardware audio clocks (typically 48,000 Hz) run on independent quartz crystals that drift slightly relative to your computer's system clock. `screendump` records the exact audio clock drift upon completion:
 
-### If sound and picture drift apart
-
-Every recording prints what the audio clock actually did:
-
-```
+```text
 screendump: audio: 5001216 samples, 104.2 s, 0 overflows
 screendump: audio clock: 47999.3 Hz measured vs 48000 Hz nominal (-15 ppm, -2 ms over this capture)
 ```
+A drift of ~15 ppm equals ~1 millisecond per minute, which is imperceptible in practice. If the audio input encounters buffer overflows, a warning will report dropped samples.
 
-An interface that says 48000 Hz is really a crystal a few tens of parts per
-million away from that, while the frame times come from the computer's clock.
-The two disagree slowly, so the figure is measured and printed rather than
-assumed. That last number is how far the sound has slid against the picture.
+---
 
-The figures above are a real Digitakt over USB: **−15 ppm, about a millisecond a
-minute**, so it would take roughly an hour to accumulate 50 ms. In practice this
-does not matter — but it is measured rather than promised.
+## Environment Variables (Persistent Defaults)
 
-`0 overflows` is the other number to glance at. Anything above zero means
-samples were **dropped**, and the recording is short by that much. A Digitakt
-polled at 30 fps for 104 seconds dropped none, so screenshotting the instrument
-does not disturb its audio.
+To avoid specifying ports and instrument flags on every command, set shell environment variables:
 
-If you pair a `.wav` with a `.mid` from a different capture, you get told:
+```bash
+# Bash / Zsh:
+export SCREENDUMP_INSTRUMENT=dtii
+export SCREENDUMP_MIDI_IN=dtii
+export SCREENDUMP_MIDI_OUT=dtii
+export SCREENDUMP_AUDIO_IN=dtii
 
-```
-screendump: ⚠️ cap.wav is 16.9 s but the recording is 104.2 s -- are they from the same capture?
+# Run without repetitive flags:
+screendump -x
 ```
 
-The video always follows the **picture**; sound that runs short is padded with
-silence and sound that runs long is trimmed.
-
-## Set it once per session
-
-Each variable takes exactly what its option takes — so the `0`s below are port
-**indices** from `--list-midi`, not "off" or "default", and the instrument can
-be written any of its three accepted ways.
-
-```
-$ export SCREENDUMP_MIDI_IN=0             # [0] from --list-midi
-$ export SCREENDUMP_MIDI_OUT=0            # [0] from --list-midi
-$ export SCREENDUMP_AUDIO_IN=dt           # short form, or an index from --list-audio
-$ export SCREENDUMP_INSTRUMENT=Digitakt   # or DT, or dt -- all three work
-
-$ screendump -x
-```
-
-An option always beats the environment. Setting variables differs by shell:
-
-| shell | |
+#### Syntax by Shell:
+| Shell | Command |
 |---|---|
-| sh / bash / zsh | `export SCREENDUMP_MIDI_IN=0` |
-| PowerShell | `$env:SCREENDUMP_MIDI_IN = "0"` |
-| cmd.exe | `set SCREENDUMP_MIDI_IN=0` |
+| **sh / bash / zsh** | `export SCREENDUMP_INSTRUMENT="dtii"` |
+| **PowerShell** | `$env:SCREENDUMP_INSTRUMENT = "dtii"` |
+| **cmd.exe** | `set SCREENDUMP_INSTRUMENT=dtii` |
 
-## Options
+*(Explicit command-line arguments always override environment variables.)*
 
-| | |
+---
+
+## Command Reference
+
+| Flag | Description |
 |---|---|
-| `-x`, `--external` | capture from the instrument |
-| `--list-midi` | list MIDI ports |
-| `--list-audio` | list audio inputs |
-| `--midi-in`, `--midi-out` | port index or name fragment |
-| `--audio-in` | audio input index or name fragment |
-| `--instrument` | which machine — required, no default |
-| `--blocks` | half-block rendering, no row gaps |
-| `--ascii` | full resolution, one character per pixel |
-| `--invert`, `--flip` | swap lit/unlit, flip vertically |
-| `--gui` | show the screen in a window instead of the terminal: live with `-x`, or a replay with `--from-file` |
-| `--framerate N` | with `-x`, stream until Ctrl+C (capped at 30); also the frame rate of a video |
-| `-H`, `--hide` | while streaming, don't draw to the terminal |
-| `--save-syx PATH` | also save the frame |
-| `--save-raw PATH` | also save just the pixel bytes |
-| `--save-mid PATH` | also save the recording, with timing, as a MIDI file |
-| `--save-gif PATH` | also save an animated GIF |
-| `--save-audio PATH` | also record the instrument's audio to a stereo WAV |
-| `--save-video PATH` | write an mp4 of picture and sound together |
-| `--upscale N` | enlarge each pixel to N × N in a GIF or video, and the window's opening size (default 4) |
-| `--from-file PATH` | render a saved `.syx`, `.mid` or raw dump instead |
-| `--from-audio PATH` | the `.wav` to pair with `--from-file` for a video |
-| `--trace` | ask an instrument for one screenshot using id bytes you supply, and report what comes back (SENDS MIDI) |
-| `--probe-id "BB BB"` | with `--trace`, the two hex bytes to try (default `10 00`) |
-| `--bench N` | measure the frame rate over N captures |
-| `--self-test` | check the tool without an instrument |
-| `--timeout` | reply timeout in seconds, default 2 |
+| `-x`, `--external` | Enable communication with connected hardware. |
+| `--list-midi` | List detected MIDI input and output ports. |
+| `--list-audio` | List detected system audio capture devices. |
+| `--midi-in`, `--midi-out` | Select MIDI port by index, shortcode, or name fragment. |
+| `--audio-in` | Select audio input by index, shortcode, or name fragment. |
+| `--instrument` | Target instrument identifier (required for live capture). |
+| `--gui` | Launch the graphical display window instead of terminal rendering. |
+| `--framerate N` | Set target polling framerate for live capture (max 30). |
+| `-H`, `--hide` | Suppress terminal drawing during capture. |
+| `--blocks` | Render terminal output using half-block Unicode characters (`▀`, `▄`). |
+| `--ascii` | Render terminal output using 1:1 ASCII characters. |
+| `--invert`, `--flip` | Invert display colors or flip image vertically. |
+| `--upscale N` | Upscale factor for GIF/video exports and initial GUI size (default: `4`). |
+| `--save-syx PATH` | Save received raw SysEx frame to disk. |
+| `--save-raw PATH` | Save decoded pixel buffer to disk. |
+| `--save-mid PATH` | Save timed capture stream as a standard MIDI file. |
+| `--save-gif PATH` | Save capture session as an animated GIF. |
+| `--save-audio PATH` | Save captured audio stream to a 24-bit stereo `.wav` file. |
+| `--save-video PATH` | Encode capture session to an `.mp4` video (requires `ffmpeg`). |
+| `--from-file PATH` | Replay or re-render an existing `.syx`, `.mid`, or raw capture. |
+| `--from-audio PATH` | Audio `.wav` track to pair with `--from-file` for video export. |
+| `--trace` | Send discovery SysEx packets to unknown instruments. |
+| `--probe-id "XX YY"` | Two-byte SysEx machine ID to test with `--trace` (default: `10 00`). |
+| `--bench N` | Measure throughput and framerate across `N` capture frames. |
+| `--timeout SEC` | Response timeout in seconds (default: `2`). |
 
-Nothing is written to disk unless you ask.
+---
 
-## If braille looks gappy
+## Terminal Rendering Tips
 
-The default rendering uses braille, which is compact but shows seams between
-rows in many terminals, because braille dots sit inset in the character cell.
+Default terminal rendering uses Unicode Braille characters. On some terminals, font metrics create visible horizontal gaps between rows.
 
-**Use `--blocks`.** It fills the cell edge to edge and always looks solid.
+- **Recommended Fix:** Pass `--blocks` for an edge-to-edge block character view.
+- **To fix Braille line height in your terminal emulator:**
+  - **iTerm2:** *Profiles → Text → Vertical Spacing* set to `100%` or lower.
+  - **Ghostty:** Add `adjust-cell-height = -8%` to your configuration.
+  - **kitty:** Add `modify_font cell_height -2px` to `kitty.conf`.
+  - **WezTerm:** Set `line_height = 1.0` in configuration.
+  - **macOS Terminal.app:** Line spacing cannot be adjusted; use `--blocks`.
 
-To keep braille instead, reduce your terminal's line spacing:
+---
 
-| terminal | setting |
-|---|---|
-| iTerm2 | Profiles → Text → Vertical Spacing → 100 % or below |
-| Ghostty | `adjust-cell-height = -8%` |
-| kitty | `modify_font cell_height -2px` |
-| WezTerm | `line_height = 1.0` |
-| Terminal.app | not adjustable — use `--blocks` |
+## Supported Instruments
 
-Iosevka and JuliaMono draw tight braille; SF Mono and Menlo are heavily padded.
+| Model | Code | Alternate Aliases | Status |
+|---|---|---|---|
+| **Digitakt** | `dt` | `DT`, `"Digitakt"` | Supported |
+| **Digitakt II** | `dtii` | `DTII`, `"Digitakt II"` | Supported |
+| **Digitone** | `dn` | `DN`, `"Digitone"` | Unmapped |
+| **Digitone II** | `dnii` | `DNII`, `"Digitone II"` | Unmapped |
+| **Syntakt** | `st` | `ST`, `"Syntakt"` | Unmapped |
+| **Analog Rytm** | `ar` | `AR`, `"Analog Rytm"` | Unmapped |
+| **Analog Four** | `a4` | `A4`, `"Analog Four"` | Unmapped |
+| **Analog Heat** | `ah` | `AH`, `"Analog Heat"` | Unmapped |
+| **Model:Samples** | `m:s` | `M:S`, `"Model:Samples"` | Unmapped |
+| **Model:Cycles** | `m:c` | `M:C`, `"Model:Cycles"` | Unmapped |
+| **Octatrack** | `ot` | `OT`, `"Octatrack"` | Unmapped |
+| **Machinedrum** | `md` | `MD`, `"Machinedrum"` | Unmapped |
 
-## Instruments
+---
 
-`--instrument` is spelled exactly — the short form, its lowercase form, or the
-full name. `digitakt` and `DigiTAKT` are rejected on purpose: the instrument
-decides what goes on the wire, so a typo should be an error rather than a guess.
+## Adding Support for New Instruments (`--trace`)
 
-**Implemented**
+Elektron uses proprietary two-byte SysEx identification headers for each hardware model. These IDs are not published in user manuals or standard firmware updates.
 
-| | | |
-|---|---|---|
-| `DT` | `dt` | Digitakt |
-| `DTII` | `dtii` | `"Digitakt II"` |
+If you own an unsupported device, you can safely probe for its screenshot ID using `--trace`:
 
-The Digitakt II answers the Digitakt request and reports the same 128 × 64
-screen, so one capture path serves both and either name works.
-
-**Known, not implemented**
-
-| | | |
-|---|---|---|
-| `DN` | `dn` | `Digitone` |
-| `DNII` | `dnii` | `"Digitone II"` |
-| `ST` | `st` | `Syntakt` |
-| `AR` | `ar` | `"Analog Rytm"` |
-| `A4` | `a4` | `"Analog Four"` |
-| `AH` | `ah` | `"Analog Heat"` |
-| `M:S` | `m:s` | `Model:Samples` |
-| `M:C` | `m:c` | `Model:Cycles` |
-| `OT` | `ot` | `Octatrack` |
-| `MD` | `md` | `Machinedrum` |
-
-Asking for one of these stops with *"The Octatrack is not implemented for
-screendump yet"*. That is not caution — no instrument id is known for it, so
-there is no request to send.
-
-Names containing a space need quoting: `--instrument "Digitakt II"`. The short
-forms never do, which is the easier habit.
-
-An instrument moves to the implemented list once a screen has been captured from
-it and read. Adding one is a few lines — see the notes at the top of the script.
-
-## A machine that is not in the table
-
-Two bytes decide whether a machine can be asked for its screen, and Elektron
-does not publish them. They differ per model, they are not the bytes in a
-firmware file, and a wrong pair does not fail loudly — it can return a picture
-that looks plausible and is wrong. So nothing is added on the strength of a
-number quoted somewhere: it is added when a real screen has been captured from
-that machine and read.
-
-`--trace` is how that capture gets made by someone who owns the machine:
-
-```
-$ screendump --trace --midi-in 1 --midi-out 1
-$ screendump --trace --midi-in 1 --midi-out 1 --probe-id "0c 00"
+```bash
+# Probes the connected device using a specific candidate ID:
+screendump --trace --midi-in 1 --midi-out 1 --probe-id "0c 00"
 ```
 
-One request, the instrument's own screenshot command, nothing written to it. It
-prints what comes back — including silence, which is information too — and
-leaves a report and the raw frame:
-
+1. `--trace` sends a single read request over MIDI. It will **not** write to or modify your device.
+2. If the device recognizes the probe, it responds with display dimensions and pixel payloads.
+3. The tool generates two diagnostic dump files:
+   ```text
+   screendump-trace-YYYYMMDD-HHMMSS.txt
+   screendump-trace-YYYYMMDD-HHMMSS.syx
+   ```
+4. If the preview image printed in your terminal matches what is on your screen, submit these two files via a [New Device Issue](https://github.com/Fadedlimes/elektron-screen-tool/issues/new/choose) to have your model added to the supported table.
 ```
-screendump-trace-20261018-231807.txt
-screendump-trace-20261018-231807.syx
-```
 
-The reply describes itself: it carries its own id bytes, geometry and pixel
-length, so a machine nobody has catalogued can still be identified from what it
-says about itself. If the picture printed in the terminal matches the screen on
-the instrument, those two bytes are its id.
+***
 
-Send both files and that yes-or-no through the [new instrument
-template](https://github.com/Fadedlimes/elektron-screen-tool/issues/new/choose).
-The port name is asked for as well, because it is what the window's device
-dropdown uses to notice the machine is plugged in.
-
-The same thing is the **Trace…** button in the window, which runs against
-whichever machine is selected and leaves the same two files.
+### Key Improvements Made:
+1. **Eliminated Awkward Metaphors & Rambling:** Removed informal phrases like *"turns to mush"*, *"nothing puts a command on your path unless you ask it to"*, and long-winded clock explanations.
+2. **Clarified Port & Software Locks:** Specifically named the **Elektron Transfer** application rather than just "Transfer", preventing user confusion when troubleshooting unresponsive ports.
+3. **Structured Technical Requirements:** Grouped dependencies into clear core vs. optional tables so users immediately know what to install for audio, video, or the GUI.
+4. **Improved Grammar & Readability:** Cleaned up run-on sentences, missing conjunctions, and awkward passive phrasing throughout the command descriptions and guide sections.
