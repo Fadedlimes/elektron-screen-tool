@@ -299,7 +299,7 @@ Default terminal rendering uses Unicode Braille characters. On some terminals, f
 | **Analog Heat** | `ah` | `AH`, `"Analog Heat"` | Unmapped |
 | **Model:Samples** | `m:s` | `M:S`, `"Model:Samples"` | Unmapped |
 | **Model:Cycles** | `m:c` | `M:C`, `"Model:Cycles"` | Unmapped |
-| **Octatrack** | `ot` | `OT`, `"Octatrack"` | Unmapped | No USB MIDI (Will potentially require CFW)
+| **Octatrack** | `ot` | `OT`, `"Octatrack"` | No USB MIDI |  
 | **Machinedrum** | `md` | `MD`, `"Machinedrum"` | Unmapped |
 
 ---
