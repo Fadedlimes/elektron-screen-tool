@@ -181,7 +181,13 @@ INSTRUMENTS = [
     Instrument("Digitone II",   "DNII"),
     Instrument("Syntakt",       "ST"),
     Instrument("Analog Rytm",   "AR"),
+    # The MKIIs answer the same 10 00 request, unchanged, with the same 128x64
+    # geometry: one screen each was captured (A4 MKII OS 1.56, Rytm MKII) and read
+    # -- page name and every parameter label, upright. So the two bytes are not a
+    # per-model id. The mk1s stay unmapped: neither has been captured.
+    Instrument("Analog Rytm MKII", "ARMKII", ident=(0x10, 0x00), width=128, height=64),
     Instrument("Analog Four",   "A4"),
+    Instrument("Analog Four MKII", "A4MKII", ident=(0x10, 0x00), width=128, height=64),
     Instrument("Analog Heat",   "AH"),
     Instrument("Model:Samples", "M:S"),
     Instrument("Model:Cycles",  "M:C"),
