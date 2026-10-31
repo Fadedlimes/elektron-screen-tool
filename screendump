@@ -73,9 +73,11 @@ building from source:
 #     F0 00 20 3C <id0> <id1>  <seven-bit-encoded body>  F7
 #
 #   00 20 3C          Elektron manufacturer id
-#   <id0> <id1>       instrument id -- see INSTRUMENTS below. Whether this is
-#                     product + unit or one 16-bit id is not established, so it
-#                     is carried as two opaque bytes per instrument.
+#   <id0> <id1>       instrument id -- see INSTRUMENTS below. Several machines
+#                     answer the same bytes (10 00), so this is not a reliable
+#                     per-model id. Whether it is product + unit or one 16-bit
+#                     id is not established, so it is carried as two opaque bytes
+#                     per instrument.
 #
 #   body = msgId:u16be  replyTo:u16be  cmd:u8  payload
 #     cmd 0x04  ScreenshotRequest    empty payload  -> a 13 byte frame
@@ -181,7 +183,9 @@ INSTRUMENTS = [
     Instrument("Digitone II",   "DNII"),
     Instrument("Syntakt",       "ST"),
     Instrument("Analog Rytm",   "AR"),
+    Instrument("Analog Rytm MKII", "ARMKII", ident=(0x10, 0x00), width=128, height=64),
     Instrument("Analog Four",   "A4"),
+    Instrument("Analog Four MKII", "A4MKII", ident=(0x10, 0x00), width=128, height=64),
     Instrument("Analog Heat",   "AH"),
     Instrument("Model:Samples", "M:S"),
     Instrument("Model:Cycles",  "M:C"),
@@ -2831,8 +2835,8 @@ def main():
 
     ap.add_argument("--probe-id", metavar="BB BB", default="10 00",
                     help="with --trace, the two id bytes to try, in hexadecimal "
-                         "(default 10 00, which both the Digitakt and the "
-                         "Digitakt II answer)")
+                         "(default 10 00, which the Digitakt, Digitakt II, "
+                         "Analog Four MKII and Analog Rytm MKII answer)")
     ap.add_argument("--gui", action="store_true",
                     help="show the screen in a window instead of the terminal: "
                          "live with -x, or a replay with --from-file. Needs "
