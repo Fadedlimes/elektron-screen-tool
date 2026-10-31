@@ -6,8 +6,8 @@ Display and record your Elektron instrument's screen in real time directly from 
 
 `screendump` queries the device's native screenshot routine over MIDI SysEx. **No firmware modifications, patching, or flashing required.**
 
-- **Platforms:** macOS and Linux supported (Windows is unverified but should work).
-- **Supported Instruments:** Digitakt (I & II). Additional Elektron devices can be probed and mapped via `--trace`.
+- **Platforms:** macOS and Linux supported. Windows 11 verified with an Analog Four MKII and Analog Rytm MKII.
+- **Supported Instruments:** Digitakt (I & II), Analog Four MKII, Analog Rytm MKII. Additional Elektron devices can be probed and mapped via `--trace`.
 
 > **Credit:** Core MIDI capture routines, protocol decoding, and export engines are based on [Jakob Bak's screendump](https://github.com/jakobbak/screendump) (MIT License). This fork adds Digitakt II support, an interactive GUI window suitable for OBS window capture, and synchronized audio recording.
 
@@ -295,7 +295,9 @@ Default terminal rendering uses Unicode Braille characters. On some terminals, f
 | **Digitone II** | `dnii` | `DNII`, `"Digitone II"` | Unmapped |
 | **Syntakt** | `st` | `ST`, `"Syntakt"` | Unmapped |
 | **Analog Rytm** | `ar` | `AR`, `"Analog Rytm"` | Unmapped |
+| **Analog Rytm MKII** | `armkii` | `ARMKII`, `"Analog Rytm MKII"` | Supported |
 | **Analog Four** | `a4` | `A4`, `"Analog Four"` | Unmapped |
+| **Analog Four MKII** | `a4mkii` | `A4MKII`, `"Analog Four MKII"` | Supported |
 | **Analog Heat** | `ah` | `AH`, `"Analog Heat"` | Unmapped |
 | **Model:Samples** | `m:s` | `M:S`, `"Model:Samples"` | Unmapped |
 | **Model:Cycles** | `m:c` | `M:C`, `"Model:Cycles"` | Unmapped |
@@ -306,7 +308,7 @@ Default terminal rendering uses Unicode Braille characters. On some terminals, f
 
 ## Adding Support for New Instruments (`--trace`)
 
-Elektron uses proprietary two-byte SysEx identification headers for each hardware model. These IDs are not published in user manuals or standard firmware updates.
+The two bytes after Elektron's manufacturer ID (`00 20 3C`) are not published. They were assumed to be a per-model ID, but the Analog Four MKII and Analog Rytm MKII answer the same `10 00` as the Digitakt, so the default probe is the first thing to try on any model.
 
 If you own an unsupported device, you can safely probe for its screenshot ID using `--trace`:
 
