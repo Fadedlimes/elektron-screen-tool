@@ -191,7 +191,7 @@ INSTRUMENTS = [
     Instrument("Analog Heat",   "AH"),
     Instrument("Model:Samples", "M:S"),
     Instrument("Model:Cycles",  "M:C"),
-    Instrument("Octatrack",     "OT"),
+    Instrument("Octatrack",     "OT",   ident=(0x10, 0x00), width=128, height=64),
     Instrument("Machinedrum",   "MD"),
 ]
 
@@ -728,7 +728,7 @@ def scale_grid(grid, n):
     return out
 
 
-def write_gif(path, grids, delays_ms, invert=False, loop=0):
+def write_gif(path, grids, delays_ms, invert=False, effect="none", loop=0):
     h = len(grids[0])
     w = len(grids[0][0])
     dark, light = (0, 0, 0), (255, 255, 255)
@@ -743,6 +743,10 @@ def write_gif(path, grids, delays_ms, invert=False, loop=0):
             + loop.to_bytes(2, "little") + b"\x00")
 
     for grid, cs in zip(grids, gif_delays(delays_ms)):
+        if effect == "flip-h":
+            grid = [row[::-1] for row in grid]
+        elif effect == "mirror":
+            grid = mirror_grid(grid)
         out += b"\x21\xf9\x04\x04" + cs.to_bytes(2, "little") + b"\x00\x00"
         out += (b"\x2c" + (0).to_bytes(2, "little") + (0).to_bytes(2, "little")
                 + w.to_bytes(2, "little") + h.to_bytes(2, "little") + b"\x00")
@@ -767,7 +771,7 @@ def write_animation(path, timed, instrument, args):
         w, h, px = parse_or_die(raw, instrument)
         grids.append(scale_grid(unpack(px, w, h, args.flip), scale))
         delays.append(ms)
-    write_gif(path, grids, delays, invert=args.invert)
+    write_gif(path, grids, delays, invert=args.invert, effect=args.effect)
     warn(f"wrote {len(grids)} frames ({sum(delays) / 1000:.1f} s), "
          f"{w * scale}x{h * scale}, to {path}")
 
@@ -1131,7 +1135,12 @@ def write_video(path, frames, end_ms, instrument, args, audio_path=None):
         for idx in order:
             if idx != shown:
                 _, _, px = parse_or_die(frames[idx][0], instrument)
-                buf = frame_bytes(unpack(px, w, h, args.flip), scale, args.invert)
+                grid = unpack(px, w, h, args.flip)
+                if args.effect == "flip-h":
+                    grid = [row[::-1] for row in grid]
+                elif args.effect == "mirror":
+                    grid = mirror_grid(grid)
+                buf = frame_bytes(grid, scale, args.invert)
                 shown = idx
             proc.stdin.write(buf)
             sent += 1
@@ -1758,6 +1767,34 @@ GUI_REC    = "#ff6060"
 GUI_ON     = (238, 245, 241)
 GUI_OFF    = (9, 11, 11)
 
+EFFECT_COLOURS = {
+    "red":    (255, 60, 60),
+    "blue":   (60, 120, 255),
+    "green":  (80, 220, 80),
+    "pink":   (255, 120, 180),
+    "purple": (180, 90, 255),
+    "orange": (255, 140, 50),
+}
+EFFECT_GEOMETRIC = ("flip-h", "mirror")
+EFFECT_COLOUR    = ("scanlines",) + tuple(EFFECT_COLOURS)
+EFFECT_CHOICES   = ("none",) + EFFECT_GEOMETRIC + EFFECT_COLOUR
+
+
+def colour_pixel(r, g, b, effect, y):
+    if effect == "scanlines" and y % 2:
+        return (r // 3, g // 3, b // 3)
+    if effect in EFFECT_COLOURS:
+        return EFFECT_COLOURS[effect]
+    return (r, g, b)
+
+
+def mirror_grid(grid):
+    out = []
+    for row in grid:
+        mid = len(row) // 2
+        out.append(row[:mid] + row[:mid][::-1])
+    return out
+
 # Rows repeat constantly on these screens -- a blank line, a line of text -- so
 # the scaled RGB for a row is built once and reused. At 30 fps that is the
 # difference between a redraw costing a few milliseconds and a few tens.
@@ -1807,6 +1844,28 @@ def png_bytes(grid, scale=1, invert=False):
                                              1, 3, 0, 0, 0))
             + png_chunk(b"PLTE", (bytes(GUI_ON) + bytes(GUI_OFF)) if invert
                         else (bytes(GUI_OFF) + bytes(GUI_ON)))
+            + png_chunk(b"IDAT", zlib.compress(bytes(body), 6))
+            + png_chunk(b"IEND", b""))
+
+
+def rgb_bytes(grid, scale=1, effect="none", invert=False):
+    h = len(grid)
+    w = len(grid[0]) if h else 0
+    body = bytearray()
+    for y, row in enumerate(grid):
+        run = bytearray()
+        for px in row:
+            lit = px if not invert else not px
+            if lit:
+                r, g, b = colour_pixel(*GUI_ON, effect, y)
+            else:
+                r, g, b = GUI_OFF
+            run += bytes((r, g, b)) * scale
+        for _ in range(scale):
+            body += b"\x00" + run
+    return (b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR", struct.pack(">IIBBBBB", w * scale, h * scale,
+                                             8, 2, 0, 0, 0))
             + png_chunk(b"IDAT", zlib.compress(bytes(body), 6))
             + png_chunk(b"IEND", b""))
 
@@ -2096,6 +2155,7 @@ class ScreenWindow:
         self.scale = max(1, args.upscale or 4)
         self.invert = bool(args.invert)
         self.flip = bool(args.flip)
+        self.effect = getattr(args, "effect", "none")
         self.recording = False
         self.rec_started = 0.0
         self._closing = False
@@ -2211,7 +2271,7 @@ class ScreenWindow:
             self.device_box.bind("<<ComboboxSelected>>", self._device_changed)
             self.trace_btn = ttk.Button(dev, text="Trace\u2026", width=8,
                                         command=self._trace)
-            self.trace_btn.pack(side="left")
+            self.trace_btn.pack(side="left", padx=(8, 0))
 
             ports = tk.Frame(self.bar, bg=GUI_PANEL)
             ports.pack(side="top", fill="x", padx=10, pady=(5, 0))
@@ -2223,19 +2283,29 @@ class ScreenWindow:
             self.out_box.pack(side="left", padx=(5, 8))
             self.connect_btn = ttk.Button(ports, text="Connect",
                                           command=self._connect)
-            self.connect_btn.pack(side="left")
+            self.connect_btn.pack(side="left", padx=(8, 0))
             ttk.Button(ports, text="⟳", width=3, command=self._rescan).pack(
-                side="left", padx=(5, 0))
+                side="left", padx=(6, 0))
 
         row = tk.Frame(self.bar, bg=GUI_PANEL)
         row.pack(side="top", fill="x", padx=10, pady=(5, 6))
         self.invert_var = tk.BooleanVar(value=self.invert)
         self.flip_var = tk.BooleanVar(value=self.flip)
+        self.effect_var = tk.StringVar(value=self.effect)
         self.top_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row, text="invert", variable=self.invert_var,
                         command=self._invert_changed).pack(side="left")
         ttk.Checkbutton(row, text="flip", variable=self.flip_var,
                         command=self._flip_changed).pack(side="left", padx=(8, 0))
+        ttk.Separator(row, orient="vertical").pack(side="left", padx=(8, 0),
+                                                    fill="y")
+        label(row, "effect").pack(side="left", padx=(4, 2))
+        self.effect_box = ttk.Combobox(row, state="readonly", width=12,
+                                       values=EFFECT_CHOICES,
+                                       textvariable=self.effect_var)
+        self.effect_box.pack(side="left", padx=(0, 8))
+        self.effect_box.bind("<<ComboboxSelected>>",
+                             lambda e: self._effect_changed())
         ttk.Checkbutton(row, text="on top", variable=self.top_var,
                         command=self._top_changed).pack(side="left", padx=(8, 0))
         if self.args.external:
@@ -2243,15 +2313,15 @@ class ScreenWindow:
             self.fps_box = ttk.Spinbox(row, from_=1, to=30, width=3,
                                        command=self._fps_changed)
             self.fps_box.set(str(max(1, min(30, self.args.framerate or 30))))
-            self.fps_box.pack(side="left", padx=(5, 0))
+            self.fps_box.pack(side="left", padx=(5, 14))
             self.fps_box.bind("<Return>", lambda e: self._fps_changed())
             self.fps_box.bind("<FocusOut>", lambda e: self._fps_changed())
         self.record_btn = ttk.Button(row, text="Record", width=10,
                                      command=self._toggle_record)
         if self.args.external:
-            self.record_btn.pack(side="right")      # primary action, far right
+            self.record_btn.pack(side="right", padx=(0, 6))      # primary action, far right
         self.snap_btn = ttk.Button(row, text="Snapshot", command=self._snapshot)
-        self.snap_btn.pack(side="right", padx=(0, 6))
+        self.snap_btn.pack(side="right", padx=(0, 10))
 
         # A line that is always there: a message when there is one, otherwise
         # the keys, which is the only place they are discoverable from inside
@@ -2467,7 +2537,14 @@ class ScreenWindow:
         if self.grid is None:
             return
         grid = self.grid[::-1] if self.flip else self.grid
-        png = png_bytes(grid, self.scale, self.invert)
+        if self.effect == "flip-h":
+            grid = [row[::-1] for row in grid]
+        elif self.effect == "mirror":
+            grid = mirror_grid(grid)
+        if self.effect in EFFECT_COLOUR:
+            png = rgb_bytes(grid, self.scale, self.effect, self.invert)
+        else:
+            png = png_bytes(grid, self.scale, self.invert)
         w = len(grid[0]) * self.scale if grid else 0
         h = len(grid) * self.scale
         if self._photo is None or (self._photo.width(), self._photo.height()) \
@@ -2644,6 +2721,16 @@ class ScreenWindow:
         self.flip = bool(self.flip_var.get())
         self._draw()
 
+    def _effect_changed(self):
+        self.effect = self.effect_var.get()
+        self._draw()
+
+    def _cycle_effect(self):
+        idx = EFFECT_CHOICES.index(self.effect) if self.effect in EFFECT_CHOICES else 0
+        self.effect = EFFECT_CHOICES[(idx + 1) % len(EFFECT_CHOICES)]
+        self.effect_var.set(self.effect)
+        self._draw()
+
     def _top_changed(self):
         self.root.attributes("-topmost", bool(self.top_var.get()))
 
@@ -2675,7 +2762,7 @@ class ScreenWindow:
                 self.replay.toggle_pause(time.monotonic())   # not a button press
         action = {"s": self._snapshot, "r": self._toggle_record,
                   "i": self._toggle_invert, "f": self._toggle_flip,
-                  "q": self.quit}.get(event.char)
+                  "e": self._cycle_effect, "q": self.quit}.get(event.char)
         if action is not None:
             action()
 
@@ -2686,10 +2773,18 @@ class ScreenWindow:
             self._flash("nothing on screen yet")
             return
         grid = self.grid[::-1] if self.flip else self.grid
+        if self.effect == "flip-h":
+            grid = [row[::-1] for row in grid]
+        elif self.effect == "mirror":
+            grid = mirror_grid(grid)
+        if self.effect in EFFECT_COLOUR:
+            png = rgb_bytes(grid, self.scale, self.effect, self.invert)
+        else:
+            png = png_bytes(grid, self.scale, self.invert)
         path = os.path.abspath(
             f"screendump-{time.strftime('%Y%m%d-%H%M%S')}.png")
         with open(path, "wb") as fh:
-            fh.write(png_bytes(grid, self.scale, self.invert))
+            fh.write(png)
         self._flash(f"wrote {os.path.basename(path)}")
 
     def _toggle_record(self):
@@ -2868,6 +2963,10 @@ def main():
     ap.add_argument("--flip", action="store_true",
                     help="flip vertically (escape hatch; not needed on verified "
                          "instruments)")
+    ap.add_argument("--effect", choices=EFFECT_CHOICES, default="none",
+                    help="live-view effect: none, flip-h (horizontal flip), "
+                         "mirror (kaleidoscope), scanlines, red, blue, green, "
+                         "pink, purple, orange")
 
     ap.add_argument("--framerate", type=int, metavar="N",
                     help="with -x, stream continuously at up to N fps (capped at "
