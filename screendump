@@ -2764,10 +2764,6 @@ class ScreenWindow:
     def _toggle_clean(self):
         self.clean_var.set(not self.clean_var.get())
         self._clean_changed()
-        if on:
-            self.bar.pack_forget()
-        else:
-            self.bar.pack(side="bottom", fill="x")
         if self._fit_job is None:
             self._fit_job = self.root.after(80, self._fit)
 
