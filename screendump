@@ -2140,6 +2140,126 @@ def port_labels(names):
     return out
 
 
+def set_managed_borderless(root):
+    """
+    Strips window decorations in a way that keeps the window managed
+    and detectable by OBS Studio across platforms without 64-bit segfaults.
+    """
+    root.update_idletasks()
+
+    # 1. LINUX (X11 / XWayland on 64-bit architectures)
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+            libx11 = ctypes.CDLL("libX11.so.6")
+
+            # Explicitly declare 64-bit pointer and integer types
+            libx11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+            libx11.XOpenDisplay.restype = ctypes.c_void_p
+
+            libx11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+            libx11.XInternAtom.restype = ctypes.c_ulong
+
+            class HINTS(ctypes.Structure):
+                _fields_ = [
+                    ("flags", ctypes.c_ulong),
+                    ("functions", ctypes.c_ulong),
+                    ("decorations", ctypes.c_ulong),
+                    ("input_mode", ctypes.c_long),
+                    ("status", ctypes.c_ulong)
+                ]
+
+            libx11.XChangeProperty.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.POINTER(HINTS),
+                ctypes.c_int
+            ]
+            libx11.XChangeProperty.restype = ctypes.c_int
+
+            libx11.XQueryTree.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+                ctypes.POINTER(ctypes.c_ulong),
+                ctypes.POINTER(ctypes.c_ulong),
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+                ctypes.POINTER(ctypes.c_uint)
+            ]
+            libx11.XQueryTree.restype = ctypes.c_int
+
+            libx11.XFlush.argtypes = [ctypes.c_void_p]
+            libx11.XFlush.restype = ctypes.c_int
+
+            display = libx11.XOpenDisplay(None)
+            if not display:
+                return False
+
+            win_id = ctypes.c_ulong(root.winfo_id())
+            motif_hints = libx11.XInternAtom(display, b"_MOTIF_WM_HINTS", False)
+
+            hints = HINTS()
+            hints.flags = 2        # MWM_HINTS_DECORATIONS
+            hints.decorations = 0  # 0 = no decorations
+
+            # Apply to client window
+            libx11.XChangeProperty(
+                display, win_id, motif_hints, motif_hints,
+                32, 0, ctypes.byref(hints), 5
+            )
+
+            # Apply to parent frame if reparented by window manager
+            root_w = ctypes.c_ulong()
+            parent_w = ctypes.c_ulong()
+            children = ctypes.POINTER(ctypes.c_ulong)()
+            nchildren = ctypes.c_uint()
+            if libx11.XQueryTree(display, win_id, ctypes.byref(root_w), ctypes.byref(parent_w), ctypes.byref(children), ctypes.byref(nchildren)):
+                if parent_w.value and parent_w.value != root_w.value:
+                    libx11.XChangeProperty(
+                        display, parent_w, motif_hints, motif_hints,
+                        32, 0, ctypes.byref(hints), 5
+                    )
+
+            libx11.XFlush(display)
+            return True
+        except Exception as e:
+            warn(f"could not set Linux borderless hints: {e}")
+            return False
+
+    # 2. WINDOWS
+    elif sys.platform.startswith("win") or sys.platform == "cygwin":
+        try:
+            import ctypes
+            GWL_STYLE = -16
+            WS_CAPTION = 0x00C00000
+            WS_THICKFRAME = 0x00040000
+            SWP_FLAGS = 0x0020 | 0x0002 | 0x0001 | 0x0004
+
+            hwnd = ctypes.windll.user32.GetParent(root.winfo_id()) or root.winfo_id()
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+            style &= ~(WS_CAPTION | WS_THICKFRAME)
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_FLAGS)
+            return True
+        except Exception as e:
+            warn(f"could not set Windows borderless style: {e}")
+            return False
+
+    # 3. MACOS
+    elif sys.platform == "darwin":
+        try:
+            root.overrideredirect(True)
+            return True
+        except Exception as e:
+            warn(f"could not set macOS borderless: {e}")
+            return False
+
+    return False
+
+
 class ScreenWindow:
     """The window: a canvas for the screen, a bar for everything else."""
 
@@ -2179,14 +2299,14 @@ class ScreenWindow:
         self.ui.configure(size=10)
 
         root.title(f"screendump — {instrument.name}")
-        if getattr(args, "borderless", False):
-            try:
-                root.overrideredirect(True)
-            except self.tk.TclError:
-                pass
         root.configure(bg=GUI_BG)
         root.protocol("WM_DELETE_WINDOW", self.quit)
-        root.minsize(360, 240)
+        self.borderless = bool(getattr(args, "borderless", False))
+        if self.borderless:
+            set_managed_borderless(root)
+            root.minsize(128, 64)
+        else:
+            root.minsize(360, 240)
 
         self._style(ttk)
         self._build(tk, ttk)
@@ -2237,7 +2357,8 @@ class ScreenWindow:
         h = self.instrument.height * self.scale
 
         self.bar = tk.Frame(self.root, bg=GUI_PANEL)
-        self.bar.pack(side="bottom", fill="x")
+        if not self.borderless:
+            self.bar.pack(side="bottom", fill="x")
 
         # status: what the source is doing, and how fast
         status = tk.Frame(self.bar, bg=GUI_PANEL)
@@ -2298,7 +2419,7 @@ class ScreenWindow:
         self.flip_var = tk.BooleanVar(value=self.flip)
         self.effect_var = tk.StringVar(value=self.effect)
         self.top_var = tk.BooleanVar(value=False)
-        self.clean_var = tk.BooleanVar(value=False)
+        self.clean_var = tk.BooleanVar(value=self.borderless)
         ttk.Checkbutton(row, text="invert", variable=self.invert_var,
                         command=self._invert_changed).pack(side="left")
         ttk.Checkbutton(row, text="flip", variable=self.flip_var,
@@ -2749,26 +2870,17 @@ class ScreenWindow:
         self.root.attributes("-topmost", bool(self.top_var.get()))
 
     def _clean_changed(self):
-        # Hide the control bar (and message line) so only the device screen
-        # shows -- useful for cropping in OBS. The bar reappears when toggled
-        # back, or via the 'c' hotkey.
+        target_w = self.instrument.width * self.scale
+        target_h = self.instrument.height * self.scale
         if self.clean_var.get():
             self.bar.pack_forget()
             self.message.pack_forget()
-            if getattr(self.args, "borderless", False):
-                try:
-                    self.root.overrideredirect(True)
-                except self.tk.TclError:
-                    pass
+            self.root.geometry(f"{target_w}x{target_h}")
         else:
-            if getattr(self.args, "borderless", False):
-                try:
-                    self.root.overrideredirect(False)
-                except self.tk.TclError:
-                    pass
             self.bar.pack(side="bottom", fill="x")
             self.message.pack(side="top", fill="x", padx=10, pady=(0, 7))
             self.message.lift()
+            self.root.geometry("")
 
     def _toggle_invert(self):
         self.invert_var.set(not self.invert_var.get())
@@ -2926,19 +3038,11 @@ def gui(instrument, args):
             warn(f"{flag} is ignored by the window — use Record or Snapshot")
 
     tk, ttk, font = _tkinter()
-    # Inject the Wayland app_id into Tk's low-level arg array before init,
-    # then remove it so argparse never sees it.
-    sys.argv.insert(1, "-name")
-    sys.argv.insert(2, "pythontestapp")
     try:
-        root = tk.Tk()
+        root = tk.Tk(className="elektronscreentool")
     except tk.TclError as exc:
         die(f"cannot open a window: {exc}\n"
             "    That needs a desktop session. Over ssh, -X forwards one.")
-    del sys.argv[1:3]
-    root.title("Elektron Screen Tool")
-    root.update_idletasks()
-    root.update()
     replay = ReplaySource(args.from_file, instrument) if args.from_file else None
     return ScreenWindow(root, tk, ttk, font, instrument, args, replay).run()
 
