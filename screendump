@@ -2926,11 +2926,16 @@ def gui(instrument, args):
             warn(f"{flag} is ignored by the window — use Record or Snapshot")
 
     tk, ttk, font = _tkinter()
+    # Inject the Wayland app_id into Tk's low-level arg array before init,
+    # then remove it so argparse never sees it.
+    sys.argv.insert(1, "-name")
+    sys.argv.insert(2, "pythontestapp")
     try:
-        root = tk.Tk(className="screendumptool")
+        root = tk.Tk()
     except tk.TclError as exc:
         die(f"cannot open a window: {exc}\n"
             "    That needs a desktop session. Over ssh, -X forwards one.")
+    del sys.argv[1:3]
     root.title("Elektron Screen Tool")
     root.update_idletasks()
     root.update()
