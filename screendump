@@ -2293,6 +2293,7 @@ class ScreenWindow:
         self.flip_var = tk.BooleanVar(value=self.flip)
         self.effect_var = tk.StringVar(value=self.effect)
         self.top_var = tk.BooleanVar(value=False)
+        self.clean_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row, text="invert", variable=self.invert_var,
                         command=self._invert_changed).pack(side="left")
         ttk.Checkbutton(row, text="flip", variable=self.flip_var,
@@ -2308,6 +2309,8 @@ class ScreenWindow:
                              lambda e: self._effect_changed())
         ttk.Checkbutton(row, text="on top", variable=self.top_var,
                         command=self._top_changed).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(row, text="clean view", variable=self.clean_var,
+                        command=self._clean_changed).pack(side="left", padx=(8, 0))
         if self.args.external:
             label(row, "fps").pack(side="left", padx=(14, 0))
             self.fps_box = ttk.Spinbox(row, from_=1, to=30, width=3,
@@ -2347,6 +2350,7 @@ class ScreenWindow:
         root.bind("<Key>", self._on_key)
         root.bind("<F11>", lambda e: self._fullscreen(True))
         root.bind("<Escape>", lambda e: self._fullscreen(False))
+        root.bind("c", lambda e: self._toggle_clean())
         root.bind("<Control-q>", lambda e: self.quit())
 
     # ------------------------------------------------------------------ ports
@@ -2734,6 +2738,18 @@ class ScreenWindow:
     def _top_changed(self):
         self.root.attributes("-topmost", bool(self.top_var.get()))
 
+    def _clean_changed(self):
+        # Hide the control bar (and message line) so only the device screen
+        # shows -- useful for cropping in OBS. The bar reappears when toggled
+        # back, or via the 'c' hotkey.
+        if self.clean_var.get():
+            self.bar.pack_forget()
+            self.message.pack_forget()
+        else:
+            self.bar.pack(side="bottom", fill="x")
+            self.message.pack(side="top", fill="x", padx=10, pady=(0, 7))
+            self.message.lift()
+
     def _toggle_invert(self):
         self.invert_var.set(not self.invert_var.get())
         self._invert_changed()
@@ -2744,6 +2760,10 @@ class ScreenWindow:
 
     def _fullscreen(self, on):
         self.root.attributes("-fullscreen", on)
+
+    def _toggle_clean(self):
+        self.clean_var.set(not self.clean_var.get())
+        self._clean_changed()
         if on:
             self.bar.pack_forget()
         else:
