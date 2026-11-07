@@ -2179,6 +2179,11 @@ class ScreenWindow:
         self.ui.configure(size=10)
 
         root.title(f"screendump — {instrument.name}")
+        if getattr(args, "borderless", False):
+            try:
+                root.overrideredirect(True)
+            except self.tk.TclError:
+                pass
         root.configure(bg=GUI_BG)
         root.protocol("WM_DELETE_WINDOW", self.quit)
         root.minsize(360, 240)
@@ -2745,7 +2750,17 @@ class ScreenWindow:
         if self.clean_var.get():
             self.bar.pack_forget()
             self.message.pack_forget()
+            if getattr(self.args, "borderless", False):
+                try:
+                    self.root.overrideredirect(True)
+                except self.tk.TclError:
+                    pass
         else:
+            if getattr(self.args, "borderless", False):
+                try:
+                    self.root.overrideredirect(False)
+                except self.tk.TclError:
+                    pass
             self.bar.pack(side="bottom", fill="x")
             self.message.pack(side="top", fill="x", padx=10, pady=(0, 7))
             self.message.lift()
@@ -2976,6 +2991,9 @@ def main():
                     help="half-block rendering, no row gaps; best for reading")
     ap.add_argument("--ascii", action="store_true", help="full-resolution ASCII")
     ap.add_argument("--invert", action="store_true", help="swap lit and unlit")
+    ap.add_argument("--borderless", action="store_true",
+                    help="with --gui, remove window title bar and borders "
+                         "(clean view for OBS); unreliable on macOS")
     ap.add_argument("--flip", action="store_true",
                     help="flip vertically (escape hatch; not needed on verified "
                          "instruments)")
