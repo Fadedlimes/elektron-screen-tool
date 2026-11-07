@@ -2349,6 +2349,11 @@ class ScreenWindow:
         self.canvas.pack(side="top", fill="both", expand=True)
         self._item = self.canvas.create_image(0, 0, anchor="nw")
         self.canvas.bind("<Configure>", self._on_resize)
+        # A borderless (overrideredirect) window has no title bar to drag, so
+        # let the canvas itself be grabbed and moved.
+        self._drag_x = self._drag_y = 0
+        self.canvas.bind("<ButtonPress-1>", self._drag_start)
+        self.canvas.bind("<B1-Motion>", self._drag_move)
 
     def _bind(self, tk):
         root = self.root
@@ -2775,6 +2780,14 @@ class ScreenWindow:
 
     def _fullscreen(self, on):
         self.root.attributes("-fullscreen", on)
+
+    def _drag_start(self, event):
+        self._drag_x = event.x_root - self.root.winfo_x()
+        self._drag_y = event.y_root - self.root.winfo_y()
+
+    def _drag_move(self, event):
+        self.root.geometry(f"+{event.x_root - self._drag_x}+"
+                          f"{event.y_root - self._drag_y}")
 
     def _toggle_clean(self):
         self.clean_var.set(not self.clean_var.get())
