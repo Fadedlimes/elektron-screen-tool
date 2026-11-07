@@ -2927,10 +2927,13 @@ def gui(instrument, args):
 
     tk, ttk, font = _tkinter()
     try:
-        root = tk.Tk()
+        root = tk.Tk(className="screendumptool")
     except tk.TclError as exc:
         die(f"cannot open a window: {exc}\n"
             "    That needs a desktop session. Over ssh, -X forwards one.")
+    root.title("Elektron Screen Tool")
+    root.update_idletasks()
+    root.update()
     replay = ReplaySource(args.from_file, instrument) if args.from_file else None
     return ScreenWindow(root, tk, ttk, font, instrument, args, replay).run()
 
